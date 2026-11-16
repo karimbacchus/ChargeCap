@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>ChargeCap</string>
+    <key>CFBundleDisplayName</key>
+    <string>ChargeCap</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.chargecap.app</string>
+    <key>CFBundleExecutable</key>
+    <string>ChargeCap</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>2.0.0</string>
+    <key>CFBundleVersion</key>
+    <string>27</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>27.0</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleURLName</key>
+            <string>com.chargecap.app</string>
+            <key>CFBundleURLSchemes</key>
+            <array>
+                <string>chargecap</string>
+            </array>
+        </dict>
+    </array>
+</dict>
+</plist>

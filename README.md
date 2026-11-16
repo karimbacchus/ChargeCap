@@ -1,120 +1,72 @@
-# AlDente 🍝
-_MacOS menu bar tool to limit maximum charging percentage_
+# ChargeCap
 
-#### Don't overcook your battery! Keep it fresh and chewy with AlDente.
+A native battery care, charge limiter, and power telemetry menu bar app for **macOS 27+** on Apple silicon and Intel MacBooks, built with Swift 6, SwiftUI, and **Liquid Glass**.
 
-## AlDente Pro 1.0 Launch!
-After months of hard work, sweat and countless plates of pasta, we are proud to release the first public version of AlDente Pro.
-
-Thanks to the incredible support of our beta testers, we can now bring AlDente Pro to everyone. You can get it at our new website: https://apphousekitchen.com
-
-The pro version includes many convenient features like Sailing Mode, Heat Protection, Calibration Mode, Shortcuts and many more. On top of all that, it has a beautiful new design that gives you access to all important information at a glance.
-
-If you would like to purchase our app and support further development of both the pro and the free version, head over to [AppHouseKitchen](https://apphousekitchen.com)!
-
-Your’s truly,
-
-David & Matthias
-
-## Why do I need this?
-Li-ion and polymer batteries (like the one in your MacBook) last the longest when operating between 20 and 60 percent. Keeping your battery at 100% at all times can shorten the lifespan of your MacBook significantly.
-More information can be found here:
-<https://batteryuniversity.com/learn/article/how_to_charge_when_to_charge_table>
+Forked from the last open-source (MIT) release of AlDente and modernized from the ground up for macOS 27 with full feature parity with closed-source AlDente Pro.
 
 ## Features
-* Max. Battery Charge allows you to set your maximum charging percentage between 20 and 100 percent. You can either set it by using the slide bar or by typing in the desired percentage in the field above and pressing enter afterwards.
-* Launch at Login does exatly what it says, it will automatically launch AlDente when you start your MacBook. Make sure you safe the AlDente program file in the Applications folder for this feature to work.
-* Allow Discharge (Beta) - When this feature is activated, your MacBook will run on battery until it has reached the desired percentage. Afterwards, it will stay at the desired battery percentage and use the power adapter again. Unfortunately, while "Allow Discharge" is activated, clamshell mode is not supported due to technical limitations.
-* Use Classic SMC Key (Intel) - When activated, AlDente will use a different pathway to inhibit charging with the benefit of inhibiting charging even if your MacBook is turned off. However, it comes with a tradeoff: The feature "Allow Discharge" is not available when its activated. Furthermore, as the name suggests, this feature is only available on Intel MacBooks.
 
-## Feature Review and Installation Process
+**Charge Control & Modes**
+- **Charge Limiter (10%–100%)**: Set your maximum battery charge limit via slider, stepper, or quick preset glass pills (`50%`, `60%`, `70%`, `80%`, `90%`, `100%`).
+- **Hardware BMS Percentage vs. macOS Percentage**: View and regulate charging using either the macOS UI battery percentage or the raw hardware gas-gauge ratio (`AppleRawCurrentCapacity` / `AppleRawMaxCapacity` mAh).
+- **Sailing Mode**: Define a hysteresis buffer (`1%–30%`, default `-5%`) below your charge limit so the battery isn't micro-charged while plugged in.
+- **Active & Automatic Discharge**: Run your MacBook on battery power even while connected to a wall charger (`CHIE` / `CH0I` adapter isolation) to actively discharge down to your target limit, with optional automatic discharge and clamshell discharge support.
+- **Top Up**: One-click override that charges your MacBook to `100%` before heading out and automatically reverts to your normal charge limit at `100%` or when unplugged.
+- **Calibration Mode**: Automated 5-step battery calibration cycle (`100%` → `15%` → `100%` → `1 hr saturation hold` → `restore to limit`) with live step progress and manual step-advance.
+- **Heat Protection**: Continuously monitors SMC thermal sensors (`TB0T`–`TB2T`, `B0AT`) and pauses charging when battery temperature exceeds your threshold (default `40.0°C`), resuming automatically after a `2.0°C` cooldown hysteresis.
+- **Sleep & Shutdown Protection**: Stop charging before macOS sleeps, optionally prevent sleep until the charge limit is reached, and control whether SMC charge inhibit persists on quit.
+- **MagSafe 3 LED Control (`ACLC`)**: Sync the physical MagSafe connector LED with ChargeCap's state (Amber while charging/topping up, Green when capped/sailing/discharging, pulsing Amber on Heat Protection), or force Green, Amber, Off (Stealth Mode), or macOS Default.
 
-https://youtu.be/8jaTSi1kL1w
+**Power Flow & Hardware Telemetry**
+- **Live Energy Routing Diagram**: Real-time wattage flow across **Adapter Input** (negotiated USB-PD voltage, current, rated wattage), **Mac System Load** (including adapter efficiency loss), **Battery Pack** (`+W` charging / `-W` discharging / bypassed), and **USB-C Ports Out**.
+- **Battery Health & Cell Balance**: Live mAh capacity (`Current`, `Full Charge`, `Nominal`, `Design`), cycle count, health percentage, pack voltage, and individual cell voltages (`BC1V`, `BC2V`, `BC3V` in mV with cell delta mV).
+- **Rolling Telemetry Sparklines**: Live history graphs for power (Adapter, System, Battery W), temperature (`°C` / `°F`), and state of charge.
 
-Thanks to Haroon21 for making this awesome video tutorial.
+**Automations, Shortcuts & URL Scheme**
+- **Built-in Scheduler**: Schedule recurring tasks (Every Day, Weekdays, Weekends, Weekly, or Monthly on the 1st) to change limits, trigger Top Up, start Calibration Mode, discharge, or enable Sailing Mode.
+- **Apple Shortcuts (`AppIntents`)**: Native actions in the macOS Shortcuts app and Spotlight (*Set Battery Charge Limit*, *Top Up Battery to 100%*, *Discharge Battery to Limit*, *Control Battery Calibration Mode*, *Configure Sailing Mode*, *Get Battery & Power Flow Status*).
+- **`chargecap://` URL Scheme & CLI**:
+  ```
+  chargecap://set-limit?percent=80
+  chargecap://top-up?enable=true
+  chargecap://discharge?enable=true
+  chargecap://calibrate?action=start|next|stop
+  chargecap://sailing?enable=true&delta=5
+  chargecap://heat-protection?enable=true&maxTemp=40
+  chargecap://magsafe?mode=auto|green|orange|off|system
+  ```
 
-## How does it work?
-The tool writes the desired value to your MacBooks SMC (System Management Controller), which handles the rest.
+**Multi-Generation SMC Engine**
+- Automatically detects and drives the appropriate AppleSMC register family for your Mac:
+  - Apple silicon M3/M4/M5 & macOS 27 (`CHIB`, `CHIC`, `CHCE`, `CHCC`, `CHIE`, `ACLC`)
+  - Apple silicon CHTE firmware (`CHTE`, `CHIE`, `ACLC`)
+  - Apple silicon M1/M2 (`CH0B`, `CH0C`, `CH0I`, `CH0J`, `ACLC`)
+  - Intel classic (`BCLM`, `BFCL`)
 
-## AlDente is tested and working with full functionality on the following MacBooks:
-* 2020 MacBook Air 13" M1 Apple Silicon
-* 2020 MacBook Pro 13" M1 Apple Silicon
-* 2020 MacBook Pro 13" with 4 TB3 ports
-* 2020 Macbook Air 13" (Intel)
-* 2019 MacBook Pro 16"
-* 2019 MacBook Pro 13"
-* 2018 MacBook Pro 15" with TouchBar
-* 2017 MacBook Pro 15"
-* 2017 Macbook Pro 13" without TouchBar
-* 2017 MacBook Air 13"
-* 2017 MacBook 12"
-* 2016 MacBook Pro 15"
-* 2016 MacBook 12"
-* 2015 MacBook 12"
+## Build, Sign, Run & Test
 
-## Limited functionality on MacBooks from 2015 and older: 
-For AlDente to work on older MacBooks you have to activate the feature "USE OLD SMC KEY (INTEL)". Allow Discharge is not available on older devices.
-* 2015 MacBook Pro 15"
-* 2015 MacBook Pro 13"
-* 2014 MacBook Air 13"
-* 2014 MacBook Pro 15"
-* 2014 MacBook Pro 13"
-* 2013 MacBook Pro 13"
-* 2013 MacBook Pro 15"
-* 2013 MacBook Air 13"
-* 2010 MacBook
+Requires macOS 27 and Xcode 27:
 
-## Download:
-You can download the app from GitHub: <https://github.com/davidwernhart/AlDente/releases>
+```bash
+make run       # build, bundle, sign with Developer ID, and launch build/ChargeCap.app
+make status    # print live battery, hardware BMS %, thermal, and power flow telemetry
+make test      # run headless SMC telemetry, state-machine, URL scheme, and Liquid Glass UI tests
+```
 
-## How to use:
-Simply extract the latest .zip release and drag the App to your Applications Folder.
+## Layout
 
-If you get the annoying `"AlDente cannot be opened because the developer cannot be verified"` or `"AlDente.app" can’t be opened because Apple can’t check it for malicious software.` messages on Catalina, simply navigate to your Applications folder using Finder, right click on AlDente and select `Open`. Then you can proceed to start the tool normally.
+```
+Sources/
+  ChargeCapCore/    SMCKit client, XPC HelperToolProtocol, IORegistry + SMC BatteryTelemetryReader
+  ChargeCapHelper/  Privileged XPC Mach daemon for SMC writes and IOPMAssertion management
+  ChargeCap/
+    App/            App entry point, status bar controller, user preferences
+    Controller/     ChargeController state machine, HelperClient installer & XPC bridge
+    Automation/     ScheduleManager, Apple Shortcuts AppIntents, chargecap:// URLCommands
+    UI/             Liquid Glass PopoverView, SettingsView, MenuBarIconRenderer
+    Dev/            SelfTest suite and snapshot renderer
+```
 
-On the first start, the application is going to ask you to allow installing a helper tool. This is necessary, since writing SMC Keys requires root privileges.
-Once finished, enter your desired max. charging percentage by clicking on the 🍝 icon on your menu bar.
+## License
 
-For some reason, macOS will always try to squeeze in a few more percent than specified by the SMC. For example, if you set yours to 80% it will stop charging at around 83%, so be patient. Strangely, this is not the case using Windows with bootcamp, therefore I have chosen not to correct this inaccuracy in code for now.
-
-Usually, the operating system will take a minute or two registering the changes, so be patient. You can check if it's working by setting the max. percentage to e.g.: 70%. After a while, clicking on your battery icon will report "Battery is not charging" if you have more than ≈73% left, even though your charger is connected. Notice that in this state, your MacBook is still powered by the charger, but the battery is not charging anymore.
-
-IMPORTANT: Keeping your battery at a lower percentage, such as 20-70%, over weeks without doing full cycles (100%-0%) can result in a disturbed battery calibration. When this happens, your Macbook might turn off with 40-50% left or your battery capacity will drop significantly. However, this is only due to a disturbed battery calibration and not because of a faulty or degraded battery. To avoid this issue, we recommend doing at least one full cycle (0%-100%) every month. Even if your battery calibration gets disturbed, doing 4-5 full cycles will recalibrate your battery and the capacity will go up again.
-
-## FAQ
-* IT DOES NOT WORK???
-
-AlDente does only prevent your Mac from charging more than you specify, it does NOT automatically drain your battery to the specified percentage.
-* STILL NOT WORKING :(
-
-Simply reboot your MacBook! This seems to do the trick for most people.
-* HOW TO UNINSTALL?
-
-Make Sure to set your max. charging percentage back to 100 before moving AlDente to the Trash. If you really want to make sure, you can also reset your Mac's SMC. If you want to also remove the helper tool, take a look at this issue: <https://github.com/davidwernhart/AlDente/issues/19>.
-* DO I HAVE TO UNCHECK THE BUILT IN BATTERY HEALTH CHECKBOX?
-
-Yes! Leaving it on results in slow charging, even when AlDente is trying to inhibit it.
-* WHAT DOES THE FEATURE "USE OLD SMC KEY (INTEL)" DO?
-
-When activated, AlDente will use a different pathway to inhibit charging with the benefit of inhibiting charging even if your MacBook is turned off. However, it comes with a tradeoff: The feature "Allow Discharge" is not available when its activated. Furthermore, as the name suggests, this feature is only available on Intel MacBooks.
-* WHY DOES ALLOW DISCHARGE NOT WORK IN CLAMSHELL MODE?
-
-Unfortunately, while "Allow Discharge" is activated, clamshell mode is not supported due to technical limitations.
-* HELP MY BATTERY CAPACITY DROPPED AND MY MACBOOK TURNS OFF WITH 50% LEFT
-
-Keeping your battery at a lower percentage, such as 20-70%, over weeks without doing full cycles (0%-100%-0%) can result in a disturbed battery calibration. When this happens, your Macbook might turn off with 40-50% left or your battery capacity will drop significantly. However, this is only due to a disturbed battery calibration and not because of a faulty or degraded battery. To avoid this issue, we recommend doing at least one full cycle (0%-100%) every month. Even if your battery calibration gets disturbed, doing 4-5 full cycles will recalibrate your battery and the capacity will go up again.
-
-## Other tools I used in this project:
-* <https://github.com/beltex/SMCKit>
-* <https://github.com/sindresorhus/LaunchAtLogin>
-* <https://github.com/andreyvit/create-dmg>
-
-## Disclaimer:
-AlDente is currently in alpha phase and bugs may still be possible. Therefore, I do not take any responsibility for any sort of damage in result of using this tool! Alltough this had no negative side effects for me, AlDente still taps in some very low level system functions that are not ment to be tampered with. Use it at your own risk!
-
-Copyright(c) 2021 David Wernhart
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+MIT License — see [LICENSE](LICENSE).
