@@ -10,9 +10,18 @@ import ChargeCapCore
 import Foundation
 import SwiftUI
 
+/// Borderless windows refuse key status by default, which makes SwiftUI render controls as inactive (grey).
+private final class KeyableWindow: NSWindow {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { true }
+}
+
 @MainActor
 public enum SelfTest {
-    public static func run(outputDirectory: URL) async -> Bool {
+    /// Regenerate the README screenshots (and all self-test renders) with one command:
+    ///   build/ChargeCap.app/Contents/MacOS/ChargeCap --selftest build/selftest --screenshots docs/screenshots
+    /// (or `make screenshots`). Hardware-free: dev mode never reaches the SMC or the helper.
+    public static func run(outputDirectory: URL, screenshotsDirectory: URL? = nil) async -> Bool {
         try? FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
         var failures: [String] = []
 
@@ -97,15 +106,19 @@ public enum SelfTest {
         prefs.chargeLimit = 80
 
         // Render the views with placeholder data (no live hardware state).
+        // Plugged in, 80% with an 80% limit, healthy helper: the canonical screenshot state.
+        HelperClient.shared.simulateConnectedForScreenshots()
         ChargeController.shared.evaluateWithSnapshot(.placeholder)
 
         // 4. Render Liquid Glass UI Snapshots for Visual Inspection
         seedPopoverHistory()
+        // A regular (not accessory) app activates reliably, which keeps controls tinted in renders.
+        NSApp.setActivationPolicy(.regular)
         for tab in PopoverTab.allCases {
             for dark in [true, false] {
                 let scheme = dark ? "dark" : "light"
                 let filename = "popover-\(tab.rawValue)-\(scheme).png"
-                let height: CGFloat = tab == .everything ? 1700 : PopoverView.preferredSize.height
+                let height: CGFloat = tab == .everything ? 1700 : (tab == .graphs ? 1000 : PopoverView.preferredSize.height)
                 let ok = await renderWindowToPNG(
                     PopoverView(initialTab: tab).environment(\.colorScheme, dark ? .dark : .light),
                     size: CGSize(width: PopoverView.preferredSize.width, height: height),
@@ -156,32 +169,84 @@ public enum SelfTest {
             check(ok, "Rendered menu bar icon gallery to menubar-icons.png")
         }
 
+        // 5. Curated README set.
+        if let shots = screenshotsDirectory {
+            try? FileManager.default.createDirectory(at: shots, withIntermediateDirectories: true)
+            let curated: [(String, String)] = [
+                ("popover-overview-dark.png", "popover-dark.png"), ("popover-overview-light.png", "popover-light.png"),
+                ("popover-graphs-dark.png", "popover-graphs.png"),
+                ("settings-charging.png", "settings-charging.png"), ("settings-battery-care.png", "settings-battery-care.png"),
+                ("settings-schedule.png", "settings-schedule.png"), ("settings-menu-bar.png", "settings-menu-bar.png"),
+                ("onboarding-1.png", "onboarding-1.png"), ("menubar-icons.png", "menubar-icons.png")
+            ]
+            for (src, dst) in curated {
+                let to = shots.appendingPathComponent(dst)
+                try? FileManager.default.removeItem(at: to)
+                let ok = (try? FileManager.default.copyItem(at: outputDirectory.appendingPathComponent(src), to: to)) != nil
+                check(ok, "Copied \(dst) to \(shots.path)")
+            }
+        }
+
         print("=== Self-Test Finished: \(failures.isEmpty ? "ALL PASSED" : "\(failures.count) FAILED") ===")
         return failures.isEmpty
     }
 
-    /// Synthetic 24 h of samples (dev store only) so the graphs have something to draw.
+    /// Synthetic 7 days of plausible usage (dev store, in memory only): unplugged for a few hours
+    /// on weekdays, recharged to the 80% limit, then held there while plugged in.
     private static func seedPopoverHistory() {
-        let store = HistoryStore.shared
-        guard store.samples.count < 2 else { return }
         let now = Date()
-        for i in 0..<144 {
-            var snap = BatterySnapshot.placeholder
-            let t = Double(i) / 143
-            snap.osPercentage = Int(45 + 35 * abs(sin(t * 5)))
-            snap.batteryTemperatureC = 30 + 6 * sin(t * 7)
-            snap.systemLoadWatts = 8 + 6 * abs(sin(t * 11))
-            snap.adapterInputWatts = i % 40 < 25 ? 30 + 10 * sin(t * 9) : 0
-            snap.batteryPowerWatts = snap.adapterInputWatts - snap.systemLoadWatts
-            store.record(snapshot: snap, limit: 80, now: now.addingTimeInterval(-86_400 + Double(i) * 600))
+        let step: TimeInterval = 600
+        let count = 7 * 144
+        var percent = 80.0
+        var out: [HistorySample] = []
+        let cal = Calendar.current
+        for i in 0..<count {
+            let t = now.addingTimeInterval(-Double(count - 1 - i) * step)
+            let hour = Double(cal.component(.hour, from: t)) + Double(cal.component(.minute, from: t)) / 60
+            let day = cal.component(.day, from: t)
+            // Slightly different unplug window each day.
+            let start = 9.5 + Double(day % 3) * 0.75
+            let unplugged = hour >= start && hour < start + 4.5 + Double(day % 2)
+            let load = unplugged ? 9 + 5 * abs(sin(Double(i) / 4)) : 6 + 3 * abs(sin(Double(i) / 9))
+            var charging = false
+            var adapter = 0.0
+            var battery = 0.0
+            if unplugged {
+                percent = max(35, percent - load / 60 * 100 * 10 / 60 * 0.9)
+                battery = -load
+            } else if percent < 79.5 {
+                charging = true
+                percent = min(80, percent + 4.5)
+                adapter = load + 38
+                battery = 38
+            } else {
+                percent = 80 - (i % 23 == 0 ? 1 : 0)
+                adapter = load + 0.5
+            }
+            let temp = 29.5 + load * 0.25 + (charging ? 3 : 0) + sin(Double(i) / 6)
+            out.append(HistorySample(
+                timestamp: t, percent: Int(percent.rounded()), hwPercent: percent, temperatureC: temp,
+                batteryW: battery, systemW: load, adapterW: adapter, isCharging: charging,
+                isPluggedIn: !unplugged, limit: 80))
         }
+        var health: [HealthSample] = []
+        let today = cal.startOfDay(for: now)
         for d in 0..<30 {
-            var snap = BatterySnapshot.placeholder
-            snap.fullChargeCapacityMah = 6000 - d / 3 * 10
-            snap.healthPercentage = 97 - Double(d) / 15
-            snap.cycleCount = 120 + d * 2
-            store.recordHealth(snapshot: snap, now: now.addingTimeInterval(-Double(30 - d) * 86_400))
+            let day = cal.date(byAdding: .day, value: -(29 - d), to: today) ?? today
+            health.append(HealthSample(day: day, fullChargeCapacityMah: 8882 + (29 - d) / 6 * 12, designCapacityMah: 8532,
+                                       healthPercent: 100, cycleCount: 11 - (29 - d) / 5))
         }
+        HistoryStore.shared.replaceForScreenshots(samples: out, health: health)
+    }
+
+    private static func captureOwnWindow(_ window: NSWindow) -> CGImage? {
+        typealias Fn = @convention(c) (CGRect, UInt32, UInt32, UInt32) -> Unmanaged<CGImage>?
+        guard let sym = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "CGWindowListCreateImage") else { return nil }
+        let fn = unsafeBitCast(sym, to: Fn.self)
+        let optionIncludingWindow: UInt32 = 1 << 3
+        let boundsIgnoreFraming: UInt32 = 1 << 0
+        let bestResolution: UInt32 = 1 << 3
+        return fn(.null, optionIncludingWindow, UInt32(window.windowNumber), boundsIgnoreFraming | bestResolution)?.takeRetainedValue()
     }
 
     private static func renderWindowToPNG<V: View>(_ view: V, size: CGSize, dark: Bool = true, to url: URL) async -> Bool {
@@ -189,7 +254,7 @@ public enum SelfTest {
         let finalSize = size
         hosting.frame = NSRect(origin: .zero, size: finalSize)
 
-        let window = NSWindow(
+        let window = KeyableWindow(
             contentRect: NSRect(x: 120, y: 120, width: finalSize.width, height: finalSize.height),
             styleMask: [.borderless],
             backing: .buffered,
@@ -199,28 +264,30 @@ public enum SelfTest {
         window.backgroundColor = dark ? NSColor(calibratedRed: 0.08, green: 0.11, blue: 0.16, alpha: 1.0) : NSColor(calibratedRed: 0.93, green: 0.94, blue: 0.96, alpha: 1.0)
         window.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
         window.contentView = hosting
-        NSApp.activate(ignoringOtherApps: true)
-        window.makeKeyAndOrderFront(nil)
+        // Make this window key (and the app active) so controls render in their active, tinted state.
+        for _ in 0..<20 {
+            NSApp.activate(ignoringOtherApps: true)
+            NSRunningApplication.current.activate(options: [.activateAllWindows])
+            window.orderOut(nil)
+            window.makeKeyAndOrderFront(nil)
+            try? await Task.sleep(for: .milliseconds(300))
+            if window.isKeyWindow && NSApp.isActive { break }
+        }
         hosting.layoutSubtreeIfNeeded()
         window.displayIfNeeded()
+        try? await Task.sleep(for: .milliseconds(150))
+        if !(window.isKeyWindow && NSApp.isActive) { print("    [warn] \(url.lastPathComponent) rendered while inactive; re-run for tinted controls") }
 
-        try? await Task.sleep(for: .milliseconds(180))
-
-        let winID = window.windowNumber
         try? FileManager.default.removeItem(at: url)
+        defer { window.orderOut(nil) }
 
-        if winID > 0 {
-            let proc = Process()
-            proc.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
-            proc.arguments = ["-x", "-o", "-l", "\(winID)", url.path]
-            try? proc.run()
-            proc.waitUntilExit()
-            if FileManager.default.fileExists(atPath: url.path) {
-                window.orderOut(nil)
-                return true
-            }
+        // Preferred: composite the real window (glass + active controls). Capturing a window owned by
+        // this process needs no Screen Recording permission. CGWindowListCreateImage is marked
+        // unavailable in the macOS 15+ SDK, so it is resolved dynamically; falls back to cacheDisplay.
+        if let image = captureOwnWindow(window), let png = NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:]),
+           (try? png.write(to: url)) != nil {
+            return true
         }
-        window.orderOut(nil)
 
         guard let rep = hosting.bitmapImageRepForCachingDisplay(in: hosting.bounds) else { return false }
         hosting.cacheDisplay(in: hosting.bounds, to: rep)

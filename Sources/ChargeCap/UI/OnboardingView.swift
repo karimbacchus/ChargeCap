@@ -7,6 +7,7 @@
 
 import AppKit
 import ChargeCapCore
+import ServiceManagement
 import SwiftUI
 
 extension Notification.Name {
@@ -83,7 +84,7 @@ public struct OnboardingView: View {
     private var helperStep: some View {
         VStack(spacing: 18) {
             hero("lock.shield", "Install the Helper",
-                 "Changing charging behaviour needs a small privileged helper. macOS will ask for your administrator password once.")
+                 "Changing charging behaviour needs a small privileged helper. You approve it once in System Settings > Login Items (Touch ID works), with no password to type.")
             VStack(spacing: 10) {
                 HStack(spacing: 8) {
                     Image(systemName: helper.isHelperConnected ? "checkmark.circle.fill" : "exclamationmark.circle")
@@ -95,6 +96,10 @@ public struct OnboardingView: View {
                 }
                 .buttonStyle(.glassProminent)
                 .controlSize(.large)
+                if helper.needsApproval {
+                    Button("Open Login Items") { SMAppService.openSystemSettingsLoginItems() }
+                        .controlSize(.large)
+                }
             }
             .padding(14)
             .frame(maxWidth: .infinity)

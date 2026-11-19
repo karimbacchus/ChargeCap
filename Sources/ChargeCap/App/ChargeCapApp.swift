@@ -56,7 +56,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if args.contains("--selftest") {
             let outDir = URL(fileURLWithPath: value(after: "--selftest") ?? "build/selftest")
             Task { @MainActor in
-                let ok = await SelfTest.run(outputDirectory: outDir)
+                let shots = value(after: "--screenshots").map { URL(fileURLWithPath: $0) }
+                let ok = await SelfTest.run(outputDirectory: outDir, screenshotsDirectory: shots)
                 exit(ok ? 0 : 1)
             }
             return

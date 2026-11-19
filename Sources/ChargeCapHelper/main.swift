@@ -115,6 +115,29 @@ public final class HelperTool: NSObject, HelperToolProtocol {
         reply(true)
     }
 
+    public func removeLegacyHelper(withReply reply: @escaping (Bool, String) -> Void) {
+        let fm = FileManager.default
+        let plist = ChargeCapConstants.legacyHelperPlistPath
+        let binary = ChargeCapConstants.legacyHelperBinaryPath
+        guard fm.fileExists(atPath: plist) || fm.fileExists(atPath: binary) else {
+            reply(true, "No legacy helper present")
+            return
+        }
+        if fm.fileExists(atPath: plist) {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+            p.arguments = ["bootout", "system/\(ChargeCapConstants.legacyHelperLabel)"]
+            p.standardOutput = FileHandle.nullDevice
+            p.standardError = FileHandle.nullDevice
+            if (try? p.run()) != nil { p.waitUntilExit() }
+        }
+        var errors: [String] = []
+        for path in [plist, binary] where fm.fileExists(atPath: path) {
+            do { try fm.removeItem(atPath: path) } catch { errors.append("\(path): \(error.localizedDescription)") }
+        }
+        reply(errors.isEmpty, errors.isEmpty ? "Legacy helper removed" : errors.joined(separator: "; "))
+    }
+
     // MARK: - CLI one-shot helpers (not part of the XPC protocol)
 
     func cliSetCharging(_ enabled: Bool) -> (Bool, String) {

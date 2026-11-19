@@ -9,8 +9,17 @@ import Foundation
 
 public enum ChargeCapConstants {
     public static let appBundleIdentifier = "com.chargecap.app"
-    public static let helperMachServiceName = "com.chargecap.app.helper"
-    public static let helperVersion = "28.0"
+    /// launchd label of the SMAppService daemon (differs from the legacy manual install on purpose).
+    public static let daemonLabel = "com.chargecap.app.daemon"
+    public static let daemonPlistName = "com.chargecap.app.daemon.plist"
+    public static let helperMachServiceName = "com.chargecap.app.daemon"
+    /// Code-signing identifier of the ChargeCapHelper binary.
+    public static let helperSigningIdentifier = "com.chargecap.app.helper"
+    /// Pre-SMAppService manual install, removed automatically once the new daemon connects.
+    public static let legacyHelperLabel = "com.chargecap.app.helper"
+    public static let legacyHelperPlistPath = "/Library/LaunchDaemons/com.chargecap.app.helper.plist"
+    public static let legacyHelperBinaryPath = "/Library/PrivilegedHelperTools/com.chargecap.app.helper"
+    public static let helperVersion = "29.0"
     public static let urlScheme = "chargecap"
 }
 
@@ -80,4 +89,6 @@ public protocol HelperToolProtocol {
     /// Only allowlisted charge-control and telemetry keys may be read.
     func readSMCBytes(key: String, withReply reply: @escaping ([UInt8]) -> Void)
     func resetAll(withReply reply: @escaping (Bool) -> Void)
+    /// Removes the old manually-installed helper (fixed legacy paths only; never touches this daemon).
+    func removeLegacyHelper(withReply reply: @escaping (Bool, String) -> Void)
 }

@@ -2,7 +2,7 @@ ifeq ($(shell xcodebuild -version >/dev/null 2>&1; echo $$?),1)
 export DEVELOPER_DIR ?= /Applications/Xcode.app/Contents/Developer
 endif
 
-.PHONY: app debug run status selftest test clean
+.PHONY: app debug run status selftest screenshots test clean
 
 BIN = build/ChargeCap.app/Contents/MacOS/ChargeCap
 
@@ -21,6 +21,9 @@ status: app
 
 selftest: app
 	$(BIN) --selftest build/selftest
+
+screenshots: app
+	$(BIN) --selftest build/selftest --screenshots docs/screenshots
 
 test: selftest
 

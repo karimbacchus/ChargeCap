@@ -1,4 +1,5 @@
 import ChargeCapCore
+import ServiceManagement
 import SwiftUI
 
 struct HelperSettingsPane: View {
@@ -22,11 +23,16 @@ struct HelperSettingsPane: View {
                     Label("A newer helper is bundled with this app.", systemImage: "arrow.triangle.2.circlepath")
                         .foregroundStyle(.orange)
                 }
+                if helper.needsApproval {
+                    Label("Waiting for approval in Login Items.", systemImage: "hand.raised")
+                        .foregroundStyle(.orange)
+                    Button("Open Login Items") { SMAppService.openSystemSettingsLoginItems() }
+                }
                 LabeledContent("Detected key family", value: helper.detectedKeyFamily.rawValue)
             } header: {
                 Text("Privileged Helper")
             } footer: {
-                FootnoteText("The helper is a small root daemon that performs the SMC writes. Installing or updating asks for an administrator password.")
+                FootnoteText("The helper is a small root daemon that performs the SMC writes. Installing or updating asks you to approve ChargeCap once in System Settings > Login Items (Touch ID works); no password is needed.")
             }
 
             Section {

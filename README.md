@@ -1,8 +1,39 @@
 # ChargeCap
 
-A native battery care, charge limiter, and power telemetry menu bar app for **macOS 27+** on Apple silicon and Intel MacBooks, built with Swift 6, SwiftUI, and **Liquid Glass**.
+A native battery care, charge limiter, and power telemetry menu bar app for **macOS 27+** on Apple silicon MacBooks, built with Swift 6, SwiftUI, and **Liquid Glass**.
 
 Forked from the last open-source (MIT) release of AlDente and modernized for macOS 27, aiming for feature parity with today's closed-source AlDente Pro. See [docs/IMPROVEMENT_PLAN.md](docs/IMPROVEMENT_PLAN.md) for the audit and roadmap.
+
+<p align="center">
+  <img src="docs/screenshots/popover-dark.png" width="300" alt="ChargeCap popover in dark mode">
+  &nbsp;
+  <img src="docs/screenshots/popover-light.png" width="300" alt="ChargeCap popover in light mode">
+</p>
+
+## Download & Install
+
+1. Download **ChargeCap.dmg** from the [latest release](https://github.com/karimbacchus/ChargeCap/releases/latest). It's signed with Developer ID and notarized by Apple.
+2. Drag **ChargeCap** into **Applications** and open it.
+3. Click **Install Helper**, then switch on ChargeCap in **System Settings › General › Login Items**. Touch ID works; no password needed.
+4. Turn off macOS's own **Optimized Battery Charging** / charge limit (System Settings › Battery) so the two don't fight each other.
+
+Requires macOS 27 or later on an Apple silicon MacBook.
+
+## Screenshots
+
+| Stats & graphs | Charging settings |
+| :---: | :---: |
+| <img src="docs/screenshots/popover-graphs.png" width="300" alt="Popover with battery specifications and history graph"> | <img src="docs/screenshots/settings-charging.png" width="480" alt="Charging settings: limit, sailing, top up, discharge"> |
+
+| Battery care | Schedules |
+| :---: | :---: |
+| <img src="docs/screenshots/settings-battery-care.png" width="420" alt="Battery care settings"> | <img src="docs/screenshots/settings-schedule.png" width="420" alt="Schedule settings"> |
+
+| Menu bar | First run |
+| :---: | :---: |
+| <img src="docs/screenshots/settings-menu-bar.png" width="420" alt="Menu bar settings"> | <img src="docs/screenshots/onboarding-1.png" width="420" alt="Onboarding"> |
+
+<p align="center"><img src="docs/screenshots/menubar-icons.png" width="640" alt="Menu bar icon styles in light and dark"></p>
 
 ## Features
 
@@ -28,7 +59,7 @@ Forked from the last open-source (MIT) release of AlDente and modernized for mac
 - **Customizable Popover & Menu Bar**: Show/hide/reorder popover widgets; ring, macOS-style battery, live status, or text icon; extra readouts; Low Power Mode tint; configurable right-click action.
 
 **Automations, Shortcuts & URL Scheme**
-- **Built-in Scheduler**: Schedule recurring tasks (Every Day, Weekdays, Weekends, Weekly, or Monthly on the 1st) to change limits, trigger Top Up, start Calibration Mode, discharge, or enable Sailing Mode.
+- **Built-in Scheduler**: Recurring tasks (Every Day, Weekdays, Weekends, Weekly, Monthly, or custom days) to change limits, Top Up, calibrate, discharge, toggle Sailing, or switch Low Power Mode, with run history and catch-up for runs missed while asleep.
 - **Apple Shortcuts (`AppIntents`)**: Native actions in the macOS Shortcuts app and Spotlight (*Set Battery Charge Limit*, *Top Up Battery to 100%*, *Discharge Battery to Limit*, *Control Battery Calibration Mode*, *Configure Sailing Mode*, *Get Battery & Power Flow Status*).
 - **`chargecap://` URL Scheme & CLI**:
   ```
@@ -48,20 +79,22 @@ Forked from the last open-source (MIT) release of AlDente and modernized for mac
   - Apple silicon M1/M2 (`CH0B`, `CH0C`, `CH0I`, `CH0J`, `ACLC`)
   - Intel classic (`BCLM`, `BFCL`)
 
-## Build, Sign, Run & Test
+## Build from Source
 
 Requires macOS 27 and Xcode 27:
 
 ```bash
-make run       # build, bundle, sign with Developer ID, and launch build/ChargeCap.app
+make run       # build, bundle, sign with Developer ID, and launch build/ChargeCap.app (copy to /Applications to install the helper)
 make status    # print live battery, hardware BMS %, thermal, and power flow telemetry
 make test      # hardware-free self-test: read-only telemetry, policy scenarios, UI snapshots to build/selftest
+make screenshots  # regenerate docs/screenshots (hardware-free renders with sample data)
+Scripts/release.sh [--publish]  # signed + notarized + stapled build/ChargeCap.dmg; --publish creates the GitHub release
 swift test     # unit tests for the charge policy and scheduler (DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer)
 ```
 
 ### Security model
 
-The privileged helper only accepts XPC connections from the ChargeCap app signed by the same team, and only writes an allowlist of charge/discharge/MagSafe SMC keys. After updating ChargeCap, use **Settings → Helper → Update Helper** (or the popover banner) once so the installed helper matches the app.
+The privileged helper only accepts XPC connections from the ChargeCap app signed by the same team, and only writes an allowlist of charge/discharge/MagSafe SMC keys. The helper is registered with `SMAppService` as a launch daemon bundled inside the app, so there is no administrator password prompt: click **Install Helper** and approve ChargeCap once in **System Settings > General > Login Items** (Touch ID works there). Keep ChargeCap in `/Applications` so the registration stays stable. If an older version installed a helper under `/Library/PrivilegedHelperTools`, the new daemon removes it automatically the first time it connects. After updating ChargeCap, use **Settings → Helper → Update Helper** (or the popover banner) if the helper version no longer matches the app.
 
 ## Layout
 

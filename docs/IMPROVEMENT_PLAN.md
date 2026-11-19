@@ -174,3 +174,11 @@ task history, catch-up for missed runs. Shortcuts & URL scheme: full AlDente act
 
 ### Phase 4 (Opus)
 Build, run unit tests + hardware-free self-test, review diffs, fix, update README to match reality.
+
+### Helper install via SMAppService
+The AppleScript admin-password installer was replaced by `SMAppService.daemon(plistName:)`. The daemon uses its own
+launchd label and mach service (`com.chargecap.app.daemon`) so it cannot collide with the legacy
+`com.chargecap.app.helper` install; the helper binary keeps signing identifier `com.chargecap.app.helper`. The user
+approves it once in Login Items (Touch ID). The daemon exposes `removeLegacyHelper` so the app can delete the old
+`/Library` install on first connect. The plist is copied to `Contents/Library/LaunchDaemons` by `Scripts/bundle.sh`
+before signing.

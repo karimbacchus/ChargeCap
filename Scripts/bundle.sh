@@ -14,11 +14,12 @@ BIN="$(swift build -c "$CONFIG" --arch arm64 --show-bin-path)"
 
 APP="build/ChargeCap.app"
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Library/LaunchDaemons"
 
 cp "$BIN/ChargeCap" "$APP/Contents/MacOS/ChargeCap"
 cp "$BIN/ChargeCapHelper" "$APP/Contents/MacOS/ChargeCapHelper"
 cp Resources/Info.plist "$APP/Contents/Info.plist"
+cp Resources/com.chargecap.app.daemon.plist "$APP/Contents/Library/LaunchDaemons/com.chargecap.app.daemon.plist"
 
 if [ ! -f Resources/AppIcon.icns ]; then
     swift Scripts/generate_icon.swift Resources/AppIcon.icns

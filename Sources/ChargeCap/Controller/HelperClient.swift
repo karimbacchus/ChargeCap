@@ -10,6 +10,7 @@ import ChargeCapCore
 import Combine
 import Foundation
 import IOKit.pwr_mgt
+import ServiceManagement
 
 @MainActor
 public final class HelperClient: ObservableObject {
@@ -23,8 +24,13 @@ public final class HelperClient: ObservableObject {
     @Published public private(set) var sleepAssertionActive: Bool = false
     @Published public private(set) var lastAppliedCommand: HardwareCommand?
 
-    private static let targetBinary = "/Library/PrivilegedHelperTools/com.chargecap.app.helper"
-    private static let targetPlist = "/Library/LaunchDaemons/com.chargecap.app.helper.plist"
+    /// True while the daemon is registered but the user has not yet approved it in Login Items.
+    @Published public private(set) var needsApproval: Bool = false
+
+    private var service: SMAppService { SMAppService.daemon(plistName: ChargeCapConstants.daemonPlistName) }
+    private var approvalPollTask: Task<Void, Never>?
+    private var legacyCleanupAttempted = false
+    private var activeObserver: NSObjectProtocol?
 
     private var xpcConnection: NSXPCConnection?
     private var localSleepAssertionID: IOPMAssertionID = 0
@@ -36,6 +42,14 @@ public final class HelperClient: ObservableObject {
 
     private init() {
         detectedKeyFamily = SMCKeyFamily.detect()
+        activeObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, self.needsApproval else { return }
+                self.refreshAfterApprovalCheck()
+            }
+        }
     }
 
     // MARK: - Connection
@@ -51,7 +65,7 @@ public final class HelperClient: ObservableObject {
         conn.remoteObjectInterface = NSXPCInterface(with: HelperToolProtocol.self)
         // Only talk to our own signed helper.
         conn.setCodeSigningRequirement(
-            CodeSigningInfo.peerRequirement(identifier: ChargeCapConstants.helperMachServiceName)
+            CodeSigningInfo.peerRequirement(identifier: ChargeCapConstants.helperSigningIdentifier)
         )
         conn.invalidationHandler = { [weak self] in
             Task { @MainActor in
@@ -100,7 +114,22 @@ public final class HelperClient: ObservableObject {
 
     // MARK: - Status
 
+    /// Dev-mode only (self-test / README screenshots): presents a healthy, connected helper in the UI.
+    /// Opens no XPC connection and touches no hardware; every write path still early-returns in dev mode.
+    public func simulateConnectedForScreenshots() {
+        guard Prefs.devMode else { return }
+        simulatedForScreenshots = true
+        needsApproval = false
+        isHelperConnected = true
+        helperNeedsUpdate = false
+        installedHelperVersion = ChargeCapConstants.helperVersion
+        helperStatusMessage = "Helper v\(ChargeCapConstants.helperVersion) active · \(detectedKeyFamily.rawValue)"
+    }
+
+    private var simulatedForScreenshots = false
+
     public func checkHelperStatus() {
+        if simulatedForScreenshots && Prefs.devMode { return }
         let bundled = ChargeCapConstants.helperVersion
         if geteuid() == 0 {
             isHelperConnected = true
@@ -108,6 +137,24 @@ public final class HelperClient: ObservableObject {
             helperNeedsUpdate = false
             helperStatusMessage = "Running with root SMC access (\(detectedKeyFamily.rawValue))"
             return
+        }
+
+        switch service.status {
+        case .notRegistered, .notFound:
+            needsApproval = false
+            isHelperConnected = false
+            installedHelperVersion = nil
+            helperNeedsUpdate = false
+            helperStatusMessage = "Helper not installed"
+            return
+        case .requiresApproval:
+            isHelperConnected = false
+            installedHelperVersion = nil
+            helperNeedsUpdate = false
+            markNeedsApproval()
+            return
+        default:
+            needsApproval = false
         }
 
         let remote = connection().remoteObjectProxyWithErrorHandler { [weak self] _ in
@@ -129,6 +176,7 @@ public final class HelperClient: ObservableObject {
                     self.isHelperConnected = true
                     self.helperNeedsUpdate = false
                     self.helperStatusMessage = "Helper v\(version) active · \(self.detectedKeyFamily.rawValue)"
+                    self.cleanUpLegacyHelperIfNeeded()
                     if !wasConnected {
                         // (Re)connected: make sure the next apply re-sends everything.
                         self.sentCommand = nil
@@ -146,86 +194,130 @@ public final class HelperClient: ObservableObject {
 
     // MARK: - Install / uninstall
 
-    private static func shellQuote(_ s: String) -> String {
-        "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    private static let approvalMessage = "Approve ChargeCap in System Settings \u{203A} Login Items (Touch ID works)"
+
+    private func markNeedsApproval() {
+        needsApproval = true
+        helperStatusMessage = Self.approvalMessage
     }
 
-    private static func appleScriptEscape(_ s: String) -> String {
-        s.replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\"", with: "\\\"")
-    }
-
-    /// Runs a shell command with administrator privileges. Returns nil on success, else an error message.
-    private func runAdminShell(_ shellCmd: String) -> String? {
-        let source = "do shell script \"\(Self.appleScriptEscape(shellCmd))\" with administrator privileges"
-        guard let script = NSAppleScript(source: source) else { return "Could not create install script" }
-        var errorDict: NSDictionary?
-        script.executeAndReturnError(&errorDict)
-        if let errorDict {
-            return (errorDict[NSAppleScript.errorMessage] as? String) ?? "Authorization cancelled or failed"
+    /// Removes the old /Library helper (via the new root daemon) once per launch.
+    private func cleanUpLegacyHelperIfNeeded() {
+        guard !legacyCleanupAttempted else { return }
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: ChargeCapConstants.legacyHelperPlistPath)
+            || fm.fileExists(atPath: ChargeCapConstants.legacyHelperBinaryPath) else { return }
+        legacyCleanupAttempted = true
+        guard let remote = proxy() else { return }
+        remote.removeLegacyHelper { ok, message in
+            NSLog("ChargeCap: legacy helper cleanup ok=\(ok): \(message)")
         }
-        return nil
     }
 
-    /// Installs or updates the privileged helper via an administrator prompt.
+    /// Registers (or re-registers, if outdated) the daemon with SMAppService; approval happens in Login Items.
     public func installOrUpdateHelper() {
-        guard let helperSourceURL = Bundle.main.url(forAuxiliaryExecutable: "ChargeCapHelper")
-            ?? Bundle.main.executableURL?.deletingLastPathComponent().appendingPathComponent("ChargeCapHelper") else {
-            helperStatusMessage = "ChargeCapHelper binary not found in bundle"
-            return
-        }
+        guard !Prefs.devMode else { return }
+        approvalPollTask?.cancel()
+        approvalPollTask = nil
 
-        let binary = Self.targetBinary
-        let plist = Self.targetPlist
-        let plistContent = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
-            + "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">"
-            + "<plist version=\"1.0\"><dict>"
-            + "<key>Label</key><string>\(ChargeCapConstants.helperMachServiceName)</string>"
-            + "<key>MachServices</key><dict><key>\(ChargeCapConstants.helperMachServiceName)</key><true/></dict>"
-            + "<key>ProgramArguments</key><array><string>\(binary)</string></array>"
-            + "<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>"
-            + "</dict></plist>"
-
-        let q = Self.shellQuote
-        let shellCmd = [
-            "mkdir -p /Library/PrivilegedHelperTools",
-            "launchctl bootout system \(q(plist)) 2>/dev/null || true",
-            "cp -f \(q(helperSourceURL.path)) \(q(binary))",
-            "chown root:wheel \(q(binary))",
-            "chmod 755 \(q(binary))",
-            "printf '%s\\n' \(q(plistContent)) > \(q(plist))",
-            "chown root:wheel \(q(plist))",
-            "chmod 644 \(q(plist))",
-            "launchctl bootstrap system \(q(plist))"
-        ].joined(separator: " && ")
-
-        if let error = runAdminShell(shellCmd) {
-            helperStatusMessage = "Helper installation failed: \(error)"
-            return
+        if service.status == .enabled {
+            // Re-register so launchd picks up the bundled (newer) helper binary.
+            try? service.unregister()
         }
         dropConnection()
         installedHelperVersion = nil
-        helperStatusMessage = "Helper installed, connecting…"
+        legacyCleanupAttempted = false
+
+        do {
+            try service.register()
+        } catch {
+            // register() also throws when approval is still required; the status tells the two apart.
+            if service.status == .requiresApproval {
+                // handled below
+            } else if service.status != .enabled {
+                helperStatusMessage = "Helper installation failed: \(error.localizedDescription)"
+                return
+            }
+        }
+
+        switch service.status {
+        case .enabled:
+            needsApproval = false
+            helperStatusMessage = "Helper installed, connecting…"
+            scheduleConnectCheck()
+        case .requiresApproval:
+            markNeedsApproval()
+            SMAppService.openSystemSettingsLoginItems()
+            startApprovalPolling()
+        default:
+            needsApproval = false
+            helperStatusMessage = "Helper registration did not complete (is ChargeCap in /Applications?)"
+        }
+    }
+
+    private func scheduleConnectCheck() {
         Task { @MainActor in
             try? await Task.sleep(nanoseconds: 800_000_000)
             self.checkHelperStatus()
         }
     }
 
-    public func uninstallHelper() {
-        let q = Self.shellQuote
-        let shellCmd = [
-            "launchctl bootout system \(q(Self.targetPlist)) 2>/dev/null || true",
-            "rm -f \(q(Self.targetBinary)) \(q(Self.targetPlist))"
-        ].joined(separator: " && ")
-        if let error = runAdminShell(shellCmd) {
-            helperStatusMessage = "Helper uninstall failed: \(error)"
-            return
+    private func startApprovalPolling() {
+        approvalPollTask?.cancel()
+        approvalPollTask = Task { @MainActor [weak self] in
+            for _ in 0..<180 {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                if Task.isCancelled { return }
+                guard let self else { return }
+                if self.service.status == .enabled {
+                    self.refreshAfterApprovalCheck()
+                    return
+                }
+            }
         }
-        dropConnection()
-        installedHelperVersion = nil
-        helperNeedsUpdate = false
-        helperStatusMessage = "Helper uninstalled"
+    }
+
+    /// Called when the app regains focus or polling notices a status change.
+    private func refreshAfterApprovalCheck() {
+        if service.status == .enabled {
+            approvalPollTask?.cancel()
+            approvalPollTask = nil
+            needsApproval = false
+            dropConnection()
+            helperStatusMessage = "Helper approved, connecting…"
+            scheduleConnectCheck()
+        }
+    }
+
+    public func uninstallHelper() {
+        guard !Prefs.devMode else { return }
+        approvalPollTask?.cancel()
+        approvalPollTask = nil
+
+        let fm = FileManager.default
+        let legacyPresent = fm.fileExists(atPath: ChargeCapConstants.legacyHelperPlistPath)
+            || fm.fileExists(atPath: ChargeCapConstants.legacyHelperBinaryPath)
+        if legacyPresent, isHelperConnected, let remote = proxy() {
+            remote.removeLegacyHelper { _, _ in }
+        }
+
+        Task { @MainActor in
+            if legacyPresent, self.isHelperConnected {
+                // Give the daemon a moment to finish before it is unregistered.
+                try? await Task.sleep(nanoseconds: 500_000_000)
+            }
+            do {
+                try await self.service.unregister()
+            } catch {
+                self.helperStatusMessage = "Helper uninstall failed: \(error.localizedDescription)"
+                return
+            }
+            self.dropConnection()
+            self.installedHelperVersion = nil
+            self.helperNeedsUpdate = false
+            self.needsApproval = false
+            self.helperStatusMessage = "Helper uninstalled"
+        }
     }
 
     // MARK: - Hardware control
@@ -393,6 +485,9 @@ public final class HelperClient: ObservableObject {
     // MARK: - Diagnostics (read-only)
 
     public func readSMCDiagnostics() -> [(key: String, type: String, hex: String)] {
+        if simulatedForScreenshots && Prefs.devMode {
+            return [("CHTE", "ui32", "00 00 00 00"), ("CHIE", "hex_", "00"), ("ACLC", "ui8 ", "03"), ("CH0C", "hex_", "00")]
+        }
         var rows: [(key: String, type: String, hex: String)] = []
         for key in SMCChargeControl.diagnosticKeys {
             guard let info = try? SMCKit.keyInformation(key) else {

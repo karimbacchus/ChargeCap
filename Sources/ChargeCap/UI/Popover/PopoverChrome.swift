@@ -5,6 +5,7 @@
 
 import AppKit
 import ChargeCapCore
+import ServiceManagement
 import SwiftUI
 
 struct PopoverHeader: View {
@@ -90,7 +91,7 @@ struct PopoverFooter: View {
                 .foregroundStyle(.orange)
                 .symbolEffect(.pulse)
             VStack(alignment: .leading, spacing: 1) {
-                Text(update ? "Helper update required" : "Helper not installed")
+                Text(update ? "Helper update required" : (helper.needsApproval ? "Approval needed" : "Helper not installed"))
                     .font(.subheadline.weight(.semibold))
                 Text(update ? "Update to keep charge control working." : helper.helperStatusMessage)
                     .font(.caption)
@@ -98,9 +99,15 @@ struct PopoverFooter: View {
                     .lineLimit(2)
             }
             Spacer(minLength: 4)
-            Button(update ? "Update" : "Install") { helper.installOrUpdateHelper() }
-                .buttonStyle(.glassProminent)
-                .controlSize(.small)
+            if helper.needsApproval {
+                Button("Open Login Items") { SMAppService.openSystemSettingsLoginItems() }
+                    .buttonStyle(.glassProminent)
+                    .controlSize(.small)
+            } else {
+                Button(update ? "Update" : "Install") { helper.installOrUpdateHelper() }
+                    .buttonStyle(.glassProminent)
+                    .controlSize(.small)
+            }
         }
         .padding(12)
         .glassEffect(.regular.tint(Color.orange.opacity(0.25)), in: .rect(cornerRadius: 16))

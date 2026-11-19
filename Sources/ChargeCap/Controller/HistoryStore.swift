@@ -77,6 +77,14 @@ public final class HistoryStore: ObservableObject {
         return Array(samples[lo...])
     }
 
+    /// Dev mode only: replaces the in-memory history with synthetic data for screenshots. Never persisted.
+    public func replaceForScreenshots(samples newSamples: [HistorySample], health newHealth: [HealthSample]) {
+        guard Prefs.devMode else { return }
+        samples = newSamples
+        healthSamples = newHealth
+        lastSampleTime = newSamples.last?.timestamp
+    }
+
     // MARK: - Recording
 
     /// Records a sample if at least a minute has passed; also keeps today's health sample current.
