@@ -17,9 +17,16 @@ import Foundation
 /// - `chargecap://calibrate?action=start|next|stop`
 /// - `chargecap://sailing?enable=true&delta=5`
 /// - `chargecap://heat-protection?enable=true&maxTemp=35`
-/// - `chargecap://magsafe?mode=auto|green|orange|off|system`
+/// - `chargecap://magsafe?mode=auto|green|orange|off|system` (alias: `led`)
+/// - `chargecap://low-power?mode=on|off|battery|adapter|unmanaged`
+/// - `chargecap://sleep-control?duration=30m|1h|2h|5h|forever|off`
+/// - `chargecap://pause` (pauses charging at the current %; `pause?enable=false` resumes)
+/// - `chargecap://status` (refreshes telemetry)
+/// - `chargecap://open-settings?section=<name>` (posts `Notification.Name.chargeCapOpenSettings`)
 @MainActor
 public enum URLCommands {
+    private static let pausedLimitKey = "chargecap.pausedPreviousLimit"
+
     @discardableResult
     public static func handle(_ url: URL) -> Bool {
         guard url.scheme?.lowercased() == ChargeCapConstants.urlScheme else { return false }
@@ -90,7 +97,7 @@ public enum URLCommands {
             controller.evaluateAndApply()
             return true
 
-        case "magsafe":
+        case "magsafe", "led":
             if let modeStr = param("mode")?.lowercased(),
                let mode = MagSafeLEDMode(rawValue: modeStr) {
                 prefs.magSafeLEDMode = mode
@@ -99,8 +106,71 @@ public enum URLCommands {
             }
             return false
 
+        case "low-power", "lowpower", "low-power-mode":
+            let policy: LowPowerModePolicy
+            switch param("mode")?.lowercased() {
+            case "on", "always-on": policy = .alwaysOn
+            case "off", "always-off": policy = .alwaysOff
+            case "battery": policy = .onlyOnBattery
+            case "adapter", "power-adapter": policy = .onlyOnAdapter
+            case "unmanaged", "system", "auto": policy = .unmanaged
+            default: return false
+            }
+            prefs.lowPowerModePolicy = policy
+            return true
+
+        case "sleep-control", "sleepcontrol":
+            let sleep = SleepControl.shared
+            switch param("duration")?.lowercased() {
+            case "off", "stop", "cancel", "0":
+                sleep.stop()
+            case "30m": sleep.start(.minutes30)
+            case "1h": sleep.start(.hour1)
+            case "2h": sleep.start(.hours2)
+            case "5h": sleep.start(.hours5)
+            case "forever", "indefinitely", "inf":
+                sleep.start(.indefinitely)
+            default: return false
+            }
+            return true
+
+        case "pause":
+            let defaults = UserDefaults.standard
+            if boolParam("enable", default: true) {
+                controller.refreshNow()
+                let current = min(100, max(10, controller.snapshot.osPercentage))
+                if defaults.object(forKey: pausedLimitKey) == nil {
+                    defaults.set(prefs.chargeLimit, forKey: pausedLimitKey)
+                }
+                controller.isTopUpActive = false
+                if current < 20 { prefs.allowLowLimits = true }
+                controller.setChargeLimit(current)
+            } else {
+                let restored = (defaults.object(forKey: pausedLimitKey) as? Int) ?? prefs.chargeLimit
+                defaults.removeObject(forKey: pausedLimitKey)
+                controller.setChargeLimit(min(100, max(10, restored)))
+            }
+            return true
+
+        case "status":
+            controller.refreshNow()
+            return true
+
+        case "open-settings", "settings":
+            var info: [String: Any] = [:]
+            if let section = param("section"), !section.isEmpty {
+                info["section"] = String(section.prefix(40))
+            }
+            NotificationCenter.default.post(name: .chargeCapOpenSettings, object: nil, userInfo: info)
+            return true
+
         default:
             return false
         }
     }
+}
+
+public extension Notification.Name {
+    /// Posted by `chargecap://open-settings`; `userInfo["section"]` is an optional String.
+    static let chargeCapOpenSettings = Notification.Name("ChargeCapOpenSettings")
 }

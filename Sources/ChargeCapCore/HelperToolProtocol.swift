@@ -6,13 +6,11 @@
 //
 
 import Foundation
-import IOKit.pwr_mgt
 
 public enum ChargeCapConstants {
     public static let appBundleIdentifier = "com.chargecap.app"
     public static let helperMachServiceName = "com.chargecap.app.helper"
-    public static let helperDaemonPlistName = "com.chargecap.app.helper.plist"
-    public static let helperVersion = "27.1"
+    public static let helperVersion = "28.0"
     public static let urlScheme = "chargecap"
 }
 
@@ -47,7 +45,7 @@ public enum MagSafeLEDMode: String, CaseIterable, Codable, Sendable, Identifiabl
 }
 
 public enum SMCKeyFamily: String, Codable, Sendable, CaseIterable {
-    case appleSiliconModern = "Apple Silicon (CHIB/CHCE/CHIE)"
+    case appleSiliconModern = "Apple Silicon (CBTC/CHIE)"
     case appleSiliconCHTE   = "Apple Silicon (CHTE/CHIE)"
     case appleSiliconLegacy = "Apple Silicon Legacy (CH0B/CH0C/CH0I)"
     case intelClassic       = "Intel Classic (BCLM/BFCL)"
@@ -56,7 +54,7 @@ public enum SMCKeyFamily: String, Codable, Sendable, CaseIterable {
         if SMCKit.isKeyFound("CHTE") {
             return .appleSiliconCHTE
         }
-        if SMCKit.isKeyFound("CHIB") || SMCKit.isKeyFound("CHCE") {
+        if SMCKit.isKeyFound("CBTC") || SMCKit.isKeyFound("CHIB") || SMCKit.isKeyFound("CHCE") {
             return .appleSiliconModern
         }
         if SMCKit.isKeyFound("CH0B") || SMCKit.isKeyFound("CH0C") {
@@ -72,13 +70,14 @@ public enum SMCKeyFamily: String, Codable, Sendable, CaseIterable {
 @objc(HelperToolProtocol)
 public protocol HelperToolProtocol {
     func getVersion(withReply reply: @escaping (String) -> Void)
-    func setChargingEnabled(_ enabled: Bool, withReply reply: @escaping (Bool, String) -> Void)
-    func setForceDischarge(_ discharge: Bool, withReply reply: @escaping (Bool, String) -> Void)
-    func setMagSafeLED(_ value: UInt8, withReply reply: @escaping (Bool) -> Void)
+    /// Applies charging / force-discharge / LED state in one call. `ledByte` 0xFF = leave the LED alone.
+    func applyState(chargingEnabled: Bool, forceDischarge: Bool, ledByte: UInt8, withReply reply: @escaping (Bool, String) -> Void)
+    /// Runs `pmset -a|-b|-c lowpowermode 0|1`. `scope` is a PowerSourceScope raw value.
+    func setLowPowerMode(enabled: Bool, scope: String, withReply reply: @escaping (Bool, String) -> Void)
     func setMaxBatteryCharge(_ setVal: UInt8, withReply reply: @escaping (Bool) -> Void)
+    /// Only allowlisted charge-control keys may be written.
     func setSMCBytes(key: String, bytes: [UInt8], withReply reply: @escaping (Bool) -> Void)
+    /// Only allowlisted charge-control and telemetry keys may be read.
     func readSMCBytes(key: String, withReply reply: @escaping ([UInt8]) -> Void)
-    func createAssertion(assertion: String, reason: String, withReply reply: @escaping (IOPMAssertionID) -> Void)
-    func releaseAssertion(assertionID: IOPMAssertionID)
     func resetAll(withReply reply: @escaping (Bool) -> Void)
 }

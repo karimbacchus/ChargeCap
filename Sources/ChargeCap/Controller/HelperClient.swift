@@ -10,7 +10,6 @@ import ChargeCapCore
 import Combine
 import Foundation
 import IOKit.pwr_mgt
-import ServiceManagement
 
 @MainActor
 public final class HelperClient: ObservableObject {
@@ -18,15 +17,28 @@ public final class HelperClient: ObservableObject {
 
     @Published public private(set) var isHelperConnected: Bool = false
     @Published public private(set) var helperStatusMessage: String = "Checking helper…"
+    @Published public private(set) var helperNeedsUpdate: Bool = false
+    @Published public private(set) var installedHelperVersion: String?
     @Published public private(set) var detectedKeyFamily: SMCKeyFamily = SMCKeyFamily.detect()
     @Published public private(set) var sleepAssertionActive: Bool = false
+    @Published public private(set) var lastAppliedCommand: HardwareCommand?
+
+    private static let targetBinary = "/Library/PrivilegedHelperTools/com.chargecap.app.helper"
+    private static let targetPlist = "/Library/LaunchDaemons/com.chargecap.app.helper.plist"
 
     private var xpcConnection: NSXPCConnection?
     private var localSleepAssertionID: IOPMAssertionID = 0
 
+    /// What the helper has actually been sent (reset on disconnect so the next apply re-sends everything).
+    private var sentCommand: HardwareCommand?
+    private var sentLED: UInt8?
+    private var sentClassicLimit: UInt8?
+
     private init() {
         detectedKeyFamily = SMCKeyFamily.detect()
     }
+
+    // MARK: - Connection
 
     private func connection() -> NSXPCConnection {
         if let existing = xpcConnection {
@@ -37,15 +49,24 @@ public final class HelperClient: ObservableObject {
             options: .privileged
         )
         conn.remoteObjectInterface = NSXPCInterface(with: HelperToolProtocol.self)
+        // Only talk to our own signed helper.
+        conn.setCodeSigningRequirement(
+            CodeSigningInfo.peerRequirement(identifier: ChargeCapConstants.helperMachServiceName)
+        )
         conn.invalidationHandler = { [weak self] in
             Task { @MainActor in
-                self?.xpcConnection = nil
-                self?.isHelperConnected = false
+                guard let self else { return }
+                self.xpcConnection = nil
+                self.markDisconnected()
             }
         }
         conn.interruptionHandler = { [weak self] in
             Task { @MainActor in
-                self?.isHelperConnected = false
+                guard let self else { return }
+                self.markDisconnected()
+                // launchd (KeepAlive) restarts the helper; re-check shortly.
+                try? await Task.sleep(nanoseconds: 800_000_000)
+                self.checkHelperStatus()
             }
         }
         conn.resume()
@@ -53,186 +74,304 @@ public final class HelperClient: ObservableObject {
         return conn
     }
 
+    private func markDisconnected() {
+        isHelperConnected = false
+        sentCommand = nil
+        sentLED = nil
+        sentClassicLimit = nil
+    }
+
+    private func dropConnection() {
+        xpcConnection?.invalidate()
+        xpcConnection = nil
+        markDisconnected()
+    }
+
+    private func proxy() -> HelperToolProtocol? {
+        connection().remoteObjectProxyWithErrorHandler { [weak self] _ in
+            Task { @MainActor in
+                // Force a fresh send of everything on the next apply.
+                self?.sentCommand = nil
+                self?.sentLED = nil
+                self?.sentClassicLimit = nil
+            }
+        } as? HelperToolProtocol
+    }
+
+    // MARK: - Status
+
     public func checkHelperStatus() {
+        let bundled = ChargeCapConstants.helperVersion
         if geteuid() == 0 {
             isHelperConnected = true
+            installedHelperVersion = bundled
+            helperNeedsUpdate = false
             helperStatusMessage = "Running with root SMC access (\(detectedKeyFamily.rawValue))"
             return
         }
 
-        let proxy = connection().remoteObjectProxyWithErrorHandler { [weak self] _ in
+        let remote = connection().remoteObjectProxyWithErrorHandler { [weak self] _ in
             Task { @MainActor in
-                self?.isHelperConnected = false
-                self?.helperStatusMessage = "Privileged SMC Helper not running (Read-Only Telemetry)"
+                guard let self else { return }
+                self.isHelperConnected = false
+                self.installedHelperVersion = nil
+                self.helperNeedsUpdate = false
+                self.helperStatusMessage = "Privileged SMC Helper not running (Read-Only Telemetry)"
             }
         } as? HelperToolProtocol
 
-        proxy?.getVersion { [weak self] version in
+        remote?.getVersion { [weak self] version in
             Task { @MainActor in
                 guard let self else { return }
-                if version == ChargeCapConstants.helperVersion {
+                let wasConnected = self.isHelperConnected
+                self.installedHelperVersion = version
+                if version == bundled {
                     self.isHelperConnected = true
+                    self.helperNeedsUpdate = false
                     self.helperStatusMessage = "Helper v\(version) active · \(self.detectedKeyFamily.rawValue)"
+                    if !wasConnected {
+                        // (Re)connected: make sure the next apply re-sends everything.
+                        self.sentCommand = nil
+                        self.sentLED = nil
+                        self.sentClassicLimit = nil
+                    }
                 } else {
                     self.isHelperConnected = false
-                    self.helperStatusMessage = "Helper version mismatch (v\(version) vs v\(ChargeCapConstants.helperVersion))"
+                    self.helperNeedsUpdate = true
+                    self.helperStatusMessage = "Helper update required (installed v\(version), bundled v\(bundled))"
                 }
             }
         }
     }
 
-    public func installHelper() {
-        // 1. Try modern SMAppService daemon registration first if bundled in /Applications
-        let service = SMAppService.daemon(plistName: ChargeCapConstants.helperDaemonPlistName)
-        do {
-            try service.register()
-            checkHelperStatus()
-            if isHelperConnected {
-                return
-            }
-        } catch {
-            // Fall through to privileged administrator installation script
-        }
+    // MARK: - Install / uninstall
 
-        installHelperWithAdminPrompt()
+    private static func shellQuote(_ s: String) -> String {
+        "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
-    public func installHelperWithAdminPrompt() {
+    private static func appleScriptEscape(_ s: String) -> String {
+        s.replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+    }
+
+    /// Runs a shell command with administrator privileges. Returns nil on success, else an error message.
+    private func runAdminShell(_ shellCmd: String) -> String? {
+        let source = "do shell script \"\(Self.appleScriptEscape(shellCmd))\" with administrator privileges"
+        guard let script = NSAppleScript(source: source) else { return "Could not create install script" }
+        var errorDict: NSDictionary?
+        script.executeAndReturnError(&errorDict)
+        if let errorDict {
+            return (errorDict[NSAppleScript.errorMessage] as? String) ?? "Authorization cancelled or failed"
+        }
+        return nil
+    }
+
+    /// Installs or updates the privileged helper via an administrator prompt.
+    public func installOrUpdateHelper() {
         guard let helperSourceURL = Bundle.main.url(forAuxiliaryExecutable: "ChargeCapHelper")
             ?? Bundle.main.executableURL?.deletingLastPathComponent().appendingPathComponent("ChargeCapHelper") else {
             helperStatusMessage = "ChargeCapHelper binary not found in bundle"
             return
         }
 
-        let targetBinary = "/Library/PrivilegedHelperTools/com.chargecap.app.helper"
-        let targetPlist = "/Library/LaunchDaemons/com.chargecap.app.helper.plist"
+        let binary = Self.targetBinary
+        let plist = Self.targetPlist
+        let plistContent = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+            + "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">"
+            + "<plist version=\"1.0\"><dict>"
+            + "<key>Label</key><string>\(ChargeCapConstants.helperMachServiceName)</string>"
+            + "<key>MachServices</key><dict><key>\(ChargeCapConstants.helperMachServiceName)</key><true/></dict>"
+            + "<key>ProgramArguments</key><array><string>\(binary)</string></array>"
+            + "<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>"
+            + "</dict></plist>"
 
-        let plistContent = """
-        <?xml version="1.0" encoding="UTF-8"?>
-        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-        <plist version="1.0">
-        <dict>
-            <key>Label</key>
-            <string>com.chargecap.app.helper</string>
-            <key>MachServices</key>
-            <dict>
-                <key>com.chargecap.app.helper</key>
-                <true/>
-            </dict>
-            <key>ProgramArguments</key>
-            <array>
-                <string>/Library/PrivilegedHelperTools/com.chargecap.app.helper</string>
-            </array>
-            <key>RunAtLoad</key>
-            <true/>
-            <key>KeepAlive</key>
-            <true/>
-        </dict>
-        </plist>
-        """
-
-        let tempPlist = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("com.chargecap.app.helper.plist")
-        try? plistContent.write(to: tempPlist, atomically: true, encoding: .utf8)
-
+        let q = Self.shellQuote
         let shellCmd = [
             "mkdir -p /Library/PrivilegedHelperTools",
-            "cp -f '\(helperSourceURL.path)' '\(targetBinary)'",
-            "chown root:wheel '\(targetBinary)'",
-            "chmod 755 '\(targetBinary)'",
-            "cp -f '\(tempPlist.path)' '\(targetPlist)'",
-            "chown root:wheel '\(targetPlist)'",
-            "chmod 644 '\(targetPlist)'",
-            "launchctl bootout system '\(targetPlist)' 2>/dev/null || true",
-            "launchctl bootstrap system '\(targetPlist)'"
+            "launchctl bootout system \(q(plist)) 2>/dev/null || true",
+            "cp -f \(q(helperSourceURL.path)) \(q(binary))",
+            "chown root:wheel \(q(binary))",
+            "chmod 755 \(q(binary))",
+            "printf '%s\\n' \(q(plistContent)) > \(q(plist))",
+            "chown root:wheel \(q(plist))",
+            "chmod 644 \(q(plist))",
+            "launchctl bootstrap system \(q(plist))"
         ].joined(separator: " && ")
 
-        let appleScriptSource = "do shell script \"\(shellCmd.replacingOccurrences(of: "\"", with: "\\\""))\" with administrator privileges"
-        if let script = NSAppleScript(source: appleScriptSource) {
-            var errorDict: NSDictionary?
-            script.executeAndReturnError(&errorDict)
-            if errorDict == nil {
-                xpcConnection?.invalidate()
-                xpcConnection = nil
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
-                    self.checkHelperStatus()
-                }
-            } else {
-                helperStatusMessage = "Helper installation cancelled or failed"
-            }
+        if let error = runAdminShell(shellCmd) {
+            helperStatusMessage = "Helper installation failed: \(error)"
+            return
+        }
+        dropConnection()
+        installedHelperVersion = nil
+        helperStatusMessage = "Helper installed, connecting…"
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 800_000_000)
+            self.checkHelperStatus()
         }
     }
 
     public func uninstallHelper() {
-        let targetBinary = "/Library/PrivilegedHelperTools/com.chargecap.app.helper"
-        let targetPlist = "/Library/LaunchDaemons/com.chargecap.app.helper.plist"
+        let q = Self.shellQuote
         let shellCmd = [
-            "launchctl bootout system '\(targetPlist)' 2>/dev/null || true",
-            "rm -f '\(targetBinary)' '\(targetPlist)'"
+            "launchctl bootout system \(q(Self.targetPlist)) 2>/dev/null || true",
+            "rm -f \(q(Self.targetBinary)) \(q(Self.targetPlist))"
         ].joined(separator: " && ")
-        let appleScriptSource = "do shell script \"\(shellCmd.replacingOccurrences(of: "\"", with: "\\\""))\" with administrator privileges"
-        if let script = NSAppleScript(source: appleScriptSource) {
-            var errorDict: NSDictionary?
-            script.executeAndReturnError(&errorDict)
-            xpcConnection?.invalidate()
-            xpcConnection = nil
-            isHelperConnected = false
-            helperStatusMessage = "Helper uninstalled"
+        if let error = runAdminShell(shellCmd) {
+            helperStatusMessage = "Helper uninstall failed: \(error)"
+            return
         }
+        dropConnection()
+        installedHelperVersion = nil
+        helperNeedsUpdate = false
+        helperStatusMessage = "Helper uninstalled"
     }
 
-    public func setChargingEnabled(_ enabled: Bool) {
-        if isHelperConnected {
-            let proxy = connection().remoteObjectProxyWithErrorHandler { _ in } as? HelperToolProtocol
-            proxy?.setChargingEnabled(enabled) { [weak self] ok, _ in
-                if ok {
-                    Task { @MainActor in self?.isHelperConnected = true }
-                }
+    // MARK: - Hardware control
+
+    private static let directWriter: SMCChargeControl.Writer = { key, bytes in
+        (try? SMCKit.writeBytes(key: key, bytes: bytes)) != nil
+    }
+
+    /// Applies the desired hardware state. Deduped against what was last sent; `force` re-sends everything.
+    public func apply(_ command: HardwareCommand, force: Bool = false) {
+        // Dev / self-test mode must never reach the SMC, pmset or the helper.
+        guard !Prefs.devMode else { return }
+        updateSleepAssertion(command)
+
+        let isRoot = geteuid() == 0
+        guard isRoot || isHelperConnected else {
+            // Nothing can be sent right now; leave sent-state empty so we send once connected.
+            return
+        }
+
+        let hwChanged = force || sentCommand == nil
+            || sentCommand?.chargingEnabled != command.chargingEnabled
+            || sentCommand?.forceDischarge != command.forceDischarge
+        let ledChanged = command.magSafeLED != nil && (force || command.magSafeLED != sentLED)
+
+        defer { lastAppliedCommand = command }
+        guard hwChanged || ledChanged else { return }
+
+        let ledByte: UInt8 = ledChanged
+            ? (command.magSafeLED ?? SMCChargeControl.ledUntouched)
+            : SMCChargeControl.ledUntouched
+
+        if isRoot {
+            if hwChanged {
+                _ = SMCChargeControl.applyState(
+                    chargingEnabled: command.chargingEnabled,
+                    forceDischarge: command.forceDischarge,
+                    ledByte: ledByte,
+                    write: Self.directWriter
+                )
+            } else if ledChanged, let led = command.magSafeLED {
+                _ = SMCChargeControl.setMagSafeLED(led, write: Self.directWriter)
             }
         } else {
-            // Attempt direct SMC write if running with sufficient permissions
-            tryDirectSetCharging(enabled)
-        }
-    }
-
-    public func setForceDischarge(_ discharge: Bool) {
-        if isHelperConnected {
-            let proxy = connection().remoteObjectProxyWithErrorHandler { _ in } as? HelperToolProtocol
-            proxy?.setForceDischarge(discharge) { [weak self] ok, _ in
-                if ok {
-                    Task { @MainActor in self?.isHelperConnected = true }
-                }
+            guard let remote = proxy() else { return }
+            if hwChanged {
+                remote.applyState(
+                    chargingEnabled: command.chargingEnabled,
+                    forceDischarge: command.forceDischarge,
+                    ledByte: ledByte
+                ) { _, _ in }
+            } else if ledChanged, let led = command.magSafeLED {
+                remote.setSMCBytes(key: "ACLC", bytes: [led]) { _ in }
             }
-        } else {
-            tryDirectSetDischarge(discharge)
         }
-    }
 
-    public func setMagSafeLED(_ byte: UInt8) {
-        if isHelperConnected {
-            let proxy = connection().remoteObjectProxyWithErrorHandler { _ in } as? HelperToolProtocol
-            proxy?.setMagSafeLED(byte) { _ in }
-        } else {
-            try? SMCKit.writeBytes(key: "ACLC", bytes: [byte])
-        }
+        if hwChanged { sentCommand = command }
+        if ledChanged { sentLED = command.magSafeLED }
     }
 
     public func setClassicMaxCharge(_ value: UInt8) {
-        if isHelperConnected {
-            let proxy = connection().remoteObjectProxyWithErrorHandler { _ in } as? HelperToolProtocol
-            proxy?.setMaxBatteryCharge(value) { _ in }
-        } else {
-            try? SMCKit.writeBytes(key: "BCLM", bytes: [value])
+        // Dev / self-test mode must never reach the SMC, pmset or the helper.
+        guard !Prefs.devMode else { return }
+        guard value != sentClassicLimit else { return }
+        if geteuid() == 0 {
+            _ = SMCChargeControl.setMaxBatteryCharge(value, write: Self.directWriter)
+            sentClassicLimit = value
+        } else if isHelperConnected, let remote = proxy() {
+            remote.setMaxBatteryCharge(value) { _ in }
+            sentClassicLimit = value
         }
     }
 
-    public func setPreventSleep(_ prevent: Bool, reason: String = "ChargeCap Active Battery Control") {
-        if prevent {
+    public func setLowPowerMode(_ enabled: Bool, scope: PowerSourceScope) {
+        // Dev / self-test mode must never reach the SMC, pmset or the helper.
+        guard !Prefs.devMode else { return }
+        if geteuid() == 0 {
+            let flag = scope == .all ? "-a" : (scope == .battery ? "-b" : "-c")
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/pmset")
+            p.arguments = [flag, "lowpowermode", enabled ? "1" : "0"]
+            try? p.run()
+            p.waitUntilExit()
+            return
+        }
+        guard isHelperConnected, let remote = proxy() else { return }
+        remote.setLowPowerMode(enabled: enabled, scope: scope.rawValue) { [weak self] ok, message in
+            if !ok {
+                Task { @MainActor in self?.helperStatusMessage = "Low Power Mode change failed: \(message)" }
+            }
+        }
+    }
+
+    /// Synchronous (≤ ~1.5 s) cleanup for app termination.
+    public func restoreOnQuit(keepChargeInhibited: Bool) {
+        // Dev / self-test mode must never reach the SMC, pmset or the helper.
+        guard !Prefs.devMode else { return }
+        releaseSleepAssertion()
+
+        if geteuid() == 0 {
+            if keepChargeInhibited {
+                _ = SMCChargeControl.applyState(
+                    chargingEnabled: false, forceDischarge: false,
+                    ledByte: SMCChargeControl.ledUntouched, write: Self.directWriter
+                )
+            } else {
+                _ = SMCChargeControl.setForceDischarge(false, write: Self.directWriter)
+                _ = SMCChargeControl.setCharging(true, write: Self.directWriter)
+                _ = SMCChargeControl.setMagSafeLED(0x00, write: Self.directWriter)
+            }
+            return
+        }
+        guard isHelperConnected || xpcConnection != nil else { return }
+
+        let semaphore = DispatchSemaphore(value: 0)
+        let syncProxy = connection().synchronousRemoteObjectProxyWithErrorHandler { _ in
+            semaphore.signal()
+        } as? HelperToolProtocol
+        guard let syncProxy else { return }
+        let keep = keepChargeInhibited
+        nonisolated(unsafe) let remote = syncProxy
+        DispatchQueue.global(qos: .userInitiated).async {
+            if keep {
+                remote.applyState(
+                    chargingEnabled: false, forceDischarge: false,
+                    ledByte: SMCChargeControl.ledUntouched
+                ) { _, _ in semaphore.signal() }
+            } else {
+                remote.resetAll { _ in semaphore.signal() }
+            }
+        }
+        _ = semaphore.wait(timeout: .now() + 1.5)
+        sentCommand = nil
+        sentLED = nil
+    }
+
+    // MARK: - Sleep assertion (in-process)
+
+    private func updateSleepAssertion(_ command: HardwareCommand) {
+        if command.preventSleep {
             guard localSleepAssertionID == 0 else { return }
             var id: IOPMAssertionID = 0
             let res = IOPMAssertionCreateWithName(
                 kIOPMAssertionTypePreventUserIdleSystemSleep as CFString,
                 IOPMAssertionLevel(kIOPMAssertionLevelOn),
-                reason as CFString,
+                command.preventSleepReason as CFString,
                 &id
             )
             if res == kIOReturnSuccess {
@@ -240,48 +379,34 @@ public final class HelperClient: ObservableObject {
                 sleepAssertionActive = true
             }
         } else {
-            guard localSleepAssertionID != 0 else { return }
-            IOPMAssertionRelease(localSleepAssertionID)
-            localSleepAssertionID = 0
-            sleepAssertionActive = false
+            releaseSleepAssertion()
         }
     }
 
-    public func resetAllOnExit() {
-        setPreventSleep(false)
-        if isHelperConnected {
-            let proxy = connection().remoteObjectProxyWithErrorHandler { _ in } as? HelperToolProtocol
-            proxy?.resetAll { _ in }
-        } else {
-            tryDirectSetDischarge(false)
-            tryDirectSetCharging(true)
-        }
+    private func releaseSleepAssertion() {
+        guard localSleepAssertionID != 0 else { return }
+        IOPMAssertionRelease(localSleepAssertionID)
+        localSleepAssertionID = 0
+        sleepAssertionActive = false
     }
 
-    private func tryDirectSetCharging(_ enabled: Bool) {
-        if SMCKit.isKeyFound("CHIB") {
-            try? SMCKit.writeBytes(key: "CHIB", bytes: [enabled ? 0x00 : 0x02])
-        }
-        if SMCKit.isKeyFound("CHIC") {
-            try? SMCKit.writeBytes(key: "CHIC", bytes: [enabled ? 0x00 : 0x02])
-        }
-        if SMCKit.isKeyFound("CHCE") {
-            try? SMCKit.writeBytes(key: "CHCE", bytes: [enabled ? 0x01 : 0x00])
-        }
-        if SMCKit.isKeyFound("CHTE") {
-            try? SMCKit.writeBytes(key: "CHTE", bytes: enabled ? [0, 0, 0, 0] : [1, 0, 0, 0])
-        }
-        if SMCKit.isKeyFound("CH0B") {
-            try? SMCKit.writeBytes(key: "CH0B", bytes: [enabled ? 0x00 : 0x02])
-        }
-    }
+    // MARK: - Diagnostics (read-only)
 
-    private func tryDirectSetDischarge(_ discharge: Bool) {
-        if SMCKit.isKeyFound("CHIE") {
-            try? SMCKit.writeBytes(key: "CHIE", bytes: [discharge ? 0x08 : 0x00])
+    public func readSMCDiagnostics() -> [(key: String, type: String, hex: String)] {
+        var rows: [(key: String, type: String, hex: String)] = []
+        for key in SMCChargeControl.diagnosticKeys {
+            guard let info = try? SMCKit.keyInformation(key) else {
+                rows.append((key, "—", "absent"))
+                continue
+            }
+            let hex: String
+            if let bytes = try? SMCKit.readBytes(key: key) {
+                hex = bytes.map { String(format: "%02X", $0) }.joined(separator: " ")
+            } else {
+                hex = "unreadable"
+            }
+            rows.append((key, info.type.toString().trimmingCharacters(in: .whitespaces), hex))
         }
-        if SMCKit.isKeyFound("CH0I") {
-            try? SMCKit.writeBytes(key: "CH0I", bytes: [discharge ? 0x01 : 0x00])
-        }
+        return rows
     }
 }

@@ -2,7 +2,7 @@
 
 A native battery care, charge limiter, and power telemetry menu bar app for **macOS 27+** on Apple silicon and Intel MacBooks, built with Swift 6, SwiftUI, and **Liquid Glass**.
 
-Forked from the last open-source (MIT) release of AlDente and modernized from the ground up for macOS 27 with full feature parity with closed-source AlDente Pro.
+Forked from the last open-source (MIT) release of AlDente and modernized for macOS 27, aiming for feature parity with today's closed-source AlDente Pro. See [docs/IMPROVEMENT_PLAN.md](docs/IMPROVEMENT_PLAN.md) for the audit and roadmap.
 
 ## Features
 
@@ -12,15 +12,20 @@ Forked from the last open-source (MIT) release of AlDente and modernized from th
 - **Sailing Mode**: Define a hysteresis buffer (`1%–30%`, default `-5%`) below your charge limit so the battery isn't micro-charged while plugged in.
 - **Active & Automatic Discharge**: Run your MacBook on battery power even while connected to a wall charger (`CHIE` / `CH0I` adapter isolation) to actively discharge down to your target limit, with optional automatic discharge and clamshell discharge support.
 - **Top Up**: One-click override that charges your MacBook to `100%` before heading out and automatically reverts to your normal charge limit at `100%` or when unplugged.
-- **Calibration Mode**: Automated 5-step battery calibration cycle (`100%` → `15%` → `100%` → `1 hr saturation hold` → `restore to limit`) with live step progress and manual step-advance.
-- **Heat Protection**: Continuously monitors SMC thermal sensors (`TB0T`–`TB2T`, `B0AT`) and pauses charging when battery temperature exceeds your threshold (default `40.0°C`), resuming automatically after a `2.0°C` cooldown hysteresis.
+- **Calibration Mode**: Automated 5-step cycle (`100%` → `10%` → `100%` → hold until the gauge reports full (10 min–2 h) → back to your limit), persisted across restarts.
+- **Heat Protection**: Pauses charging when the battery exceeds your threshold (default `35 °C`), resuming after a `2 °C` drop and at least 5 minutes; disabled during calibration.
 - **Sleep & Shutdown Protection**: Stop charging before macOS sleeps, optionally prevent sleep until the charge limit is reached, and control whether SMC charge inhibit persists on quit.
 - **MagSafe 3 LED Control (`ACLC`)**: Sync the physical MagSafe connector LED with ChargeCap's state (Amber while charging/topping up, Green when capped/sailing/discharging, pulsing Amber on Heat Protection), or force Green, Amber, Off (Stealth Mode), or macOS Default.
+
+- **Sleep Control**: Keep the Mac awake for 30 min–5 h or indefinitely; re-enables sleep below a battery threshold or when unplugged.
+- **Low Power Mode Control**: Always on/off, only on battery, or only on adapter (applied via `pmset` by the helper).
+- **Apps Using Significant Energy**: Per-app energy impact with a Quit button.
 
 **Power Flow & Hardware Telemetry**
 - **Live Energy Routing Diagram**: Real-time wattage flow across **Adapter Input** (negotiated USB-PD voltage, current, rated wattage), **Mac System Load** (including adapter efficiency loss), **Battery Pack** (`+W` charging / `-W` discharging / bypassed), and **USB-C Ports Out**.
 - **Battery Health & Cell Balance**: Live mAh capacity (`Current`, `Full Charge`, `Nominal`, `Design`), cycle count, health percentage, pack voltage, and individual cell voltages (`BC1V`, `BC2V`, `BC3V` in mV with cell delta mV).
-- **Rolling Telemetry Sparklines**: Live history graphs for power (Adapter, System, Battery W), temperature (`°C` / `°F`), and state of charge.
+- **Stats & History**: Persisted history (7 days of 1-minute samples, daily health forever) charted with Swift Charts: battery level vs. limit, temperature, power, maximum capacity, and cycle count.
+- **Customizable Popover & Menu Bar**: Show/hide/reorder popover widgets; ring, macOS-style battery, live status, or text icon; extra readouts; Low Power Mode tint; configurable right-click action.
 
 **Automations, Shortcuts & URL Scheme**
 - **Built-in Scheduler**: Schedule recurring tasks (Every Day, Weekdays, Weekends, Weekly, or Monthly on the 1st) to change limits, trigger Top Up, start Calibration Mode, discharge, or enable Sailing Mode.
@@ -50,8 +55,13 @@ Requires macOS 27 and Xcode 27:
 ```bash
 make run       # build, bundle, sign with Developer ID, and launch build/ChargeCap.app
 make status    # print live battery, hardware BMS %, thermal, and power flow telemetry
-make test      # run headless SMC telemetry, state-machine, URL scheme, and Liquid Glass UI tests
+make test      # hardware-free self-test: read-only telemetry, policy scenarios, UI snapshots to build/selftest
+swift test     # unit tests for the charge policy and scheduler (DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer)
 ```
+
+### Security model
+
+The privileged helper only accepts XPC connections from the ChargeCap app signed by the same team, and only writes an allowlist of charge/discharge/MagSafe SMC keys. After updating ChargeCap, use **Settings → Helper → Update Helper** (or the popover banner) once so the installed helper matches the app.
 
 ## Layout
 

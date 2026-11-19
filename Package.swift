@@ -26,6 +26,11 @@ let package = Package(
             dependencies: ["ChargeCapCore"],
             path: "Sources/ChargeCapHelper",
             swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
+        .testTarget(
+            name: "ChargeCapCoreTests",
+            dependencies: ["ChargeCapCore"],
+            path: "Tests/ChargeCapCoreTests"
         )
     ]
 )

@@ -14,12 +14,11 @@ BIN="$(swift build -c "$CONFIG" --arch arm64 --show-bin-path)"
 
 APP="build/ChargeCap.app"
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Library/LaunchDaemons"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 cp "$BIN/ChargeCap" "$APP/Contents/MacOS/ChargeCap"
 cp "$BIN/ChargeCapHelper" "$APP/Contents/MacOS/ChargeCapHelper"
 cp Resources/Info.plist "$APP/Contents/Info.plist"
-cp Resources/com.chargecap.app.helper.plist "$APP/Contents/Library/LaunchDaemons/com.chargecap.app.helper.plist"
 
 if [ ! -f Resources/AppIcon.icns ]; then
     swift Scripts/generate_icon.swift Resources/AppIcon.icns
@@ -30,11 +29,6 @@ cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 for cer in "$HOME"/Documents/*.cer; do
     [ -f "$cer" ] && security import "$cer" -k "$HOME/Library/Keychains/login.keychain-db" >/dev/null 2>&1 || true
 done
-
-if [ -z "${CODESIGN_IDENTITY:-}" ] && [ -f "$HOME/Documents/developerID_application.cer" ]; then
-    CODESIGN_IDENTITY="$(openssl x509 -inform DER -in "$HOME/Documents/developerID_application.cer" -noout -subject 2>/dev/null \
-        | sed -n 's/.*CN=\(Developer ID Application:[^/]*\).*/\1/p')"
-fi
 
 IDENTITY="${CODESIGN_IDENTITY:-$(security find-identity -v -p codesigning 2>/dev/null \
     | awk -F'"' '/Developer ID Application/ {print $2; exit}')}"

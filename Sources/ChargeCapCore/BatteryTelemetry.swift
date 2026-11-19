@@ -52,6 +52,10 @@ public struct BatterySnapshot: Sendable, Equatable, Codable {
     public var adapterNegotiatedAmps: Double
     public var timeRemainingMinutes: Int?
 
+    // System state
+    public var lidClosed: Bool = false
+    public var isLowPowerModeEnabled: Bool = false
+
     public var effectivePercentage: Int {
         osPercentage
     }
@@ -99,11 +103,34 @@ public struct BatterySnapshot: Sendable, Equatable, Codable {
         adapterRatedWatts: 140,
         adapterNegotiatedVolts: 20.0,
         adapterNegotiatedAmps: 4.7,
-        timeRemainingMinutes: nil
+        timeRemainingMinutes: nil,
+        lidClosed: false,
+        isLowPowerModeEnabled: false
     )
 }
 
 public enum BatteryTelemetryReader {
+    private static func signedInt(_ value: Any?) -> Int? {
+        if let num = value as? NSNumber {
+            return Int(Int64(bitPattern: num.uint64Value))
+        }
+        if let i = value as? Int {
+            return i
+        }
+        return nil
+    }
+
+    /// IOPMrootDomain "AppleClamshellState" is true when the lid is closed.
+    static func readLidClosed() -> Bool {
+        let svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPMrootDomain"))
+        guard svc != 0 else { return false }
+        defer { IOObjectRelease(svc) }
+        guard let v = IORegistryEntryCreateCFProperty(svc, "AppleClamshellState" as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue() else { return false }
+        if let b = v as? Bool { return b }
+        if let n = v as? NSNumber { return n.boolValue }
+        return false
+    }
+
     public static func readSnapshot() -> BatterySnapshot {
         var osPercentage = 100
         var isCharging = false
@@ -167,29 +194,29 @@ public enum BatteryTelemetryReader {
                 if let ext = dict["ExternalConnected"] as? Bool { isPluggedIn = ext }
                 if let chg = dict["IsCharging"] as? Bool { isCharging = chg }
                 if let full = dict["FullyCharged"] as? Bool { isFullyCharged = full }
-                if let cc = dict["CycleCount"] as? Int { cycleCount = cc }
-                if let v = dict["Voltage"] as? Int { voltageMv = v }
-                if let a = dict["Amperage"] as? Int { amperageMa = a }
-                if let rawCur = dict["AppleRawCurrentCapacity"] as? Int { currentMah = rawCur }
-                if let rawMax = dict["AppleRawMaxCapacity"] as? Int { fullMah = rawMax }
-                if let des = dict["DesignCapacity"] as? Int { designMah = des }
-                if let nom = dict["NominalChargeCapacity"] as? Int { nominalMah = nom }
+                if let cc = signedInt(dict["CycleCount"]) { cycleCount = cc }
+                if let v = signedInt(dict["Voltage"]) { voltageMv = v }
+                if let a = signedInt(dict["Amperage"]) { amperageMa = a }
+                if let rawCur = signedInt(dict["AppleRawCurrentCapacity"]) { currentMah = rawCur }
+                if let rawMax = signedInt(dict["AppleRawMaxCapacity"]) { fullMah = rawMax }
+                if let des = signedInt(dict["DesignCapacity"]) { designMah = des }
+                if let nom = signedInt(dict["NominalChargeCapacity"]) { nominalMah = nom }
 
                 if let batData = dict["BatteryData"] as? [String: Any] {
-                    if let rawCur = batData["AppleRawCurrentCapacity"] as? Int { currentMah = rawCur }
-                    if let rawMax = batData["AppleRawMaxCapacity"] as? Int { fullMah = rawMax }
-                    if let des = batData["DesignCapacity"] as? Int { designMah = des }
-                    if let nom = batData["NominalChargeCapacity"] as? Int { nominalMah = nom }
+                    if let rawCur = signedInt(batData["AppleRawCurrentCapacity"]) { currentMah = rawCur }
+                    if let rawMax = signedInt(batData["AppleRawMaxCapacity"]) { fullMah = rawMax }
+                    if let des = signedInt(batData["DesignCapacity"]) { designMah = des }
+                    if let nom = signedInt(batData["NominalChargeCapacity"]) { nominalMah = nom }
                 }
 
                 if let telemetry = dict["PowerTelemetryData"] as? [String: Any] {
-                    if let sysInMw = telemetry["SystemPowerIn"] as? Int {
+                    if let sysInMw = signedInt(telemetry["SystemPowerIn"]), sysInMw >= 0 {
                         adapterInputWatts = Double(sysInMw) / 1000.0
                     }
-                    if let sysLoadMw = telemetry["SystemLoad"] as? Int {
+                    if let sysLoadMw = signedInt(telemetry["SystemLoad"]), sysLoadMw >= 0 {
                         systemLoadWatts = Double(sysLoadMw) / 1000.0
                     }
-                    if let lossMw = telemetry["AdapterEfficiencyLoss"] as? Int {
+                    if let lossMw = signedInt(telemetry["AdapterEfficiencyLoss"]), lossMw >= 0 {
                         adapterLossWatts = Double(lossMw) / 1000.0
                     }
                 }
@@ -283,6 +310,7 @@ public enum BatteryTelemetryReader {
         }
 
         // 4. Read SMC Charge / Discharge / MagSafe states
+        let cbtc = SMCKit.readUInt8("CBTC") ?? 1
         let chib = SMCKit.readUInt8("CHIB") ?? 0
         let ch0b = SMCKit.readUInt8("CH0B") ?? 0
         let chte = SMCKit.readUInt32("CHTE") ?? 0
@@ -291,8 +319,11 @@ public enum BatteryTelemetryReader {
         let ch0i = SMCKit.readUInt8("CH0I") ?? 0
         let aclc = SMCKit.readUInt8("ACLC") ?? 0
 
-        let chargeInhibited = (chib != 0) || (ch0b != 0) || (chte != 0) || (chce == 0)
+        let chargeInhibited = (cbtc == 0) || (chib != 0) || (ch0b != 0) || (chte != 0) || (chce == 0)
         let forceDischarging = (chie != 0) || (ch0i != 0)
+        if forceDischarging {
+            isPluggedIn = true
+        }
 
         // 5. Compute derived metrics
         let voltageV = Double(voltageMv) / 1000.0
@@ -356,7 +387,9 @@ public enum BatteryTelemetryReader {
             adapterRatedWatts: adapterRatedWatts,
             adapterNegotiatedVolts: adapterVolts,
             adapterNegotiatedAmps: adapterAmps,
-            timeRemainingMinutes: timeRemainingMinutes
+            timeRemainingMinutes: timeRemainingMinutes,
+            lidClosed: readLidClosed(),
+            isLowPowerModeEnabled: ProcessInfo.processInfo.isLowPowerModeEnabled
         )
     }
 }

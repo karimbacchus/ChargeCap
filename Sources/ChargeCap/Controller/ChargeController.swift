@@ -2,6 +2,9 @@
 // ChargeController.swift
 // ChargeCap
 //
+// Thin MainActor wrapper around the pure ChargePolicy: read telemetry -> build PolicyInput ->
+// evaluate -> store the resulting transient state -> send the HardwareCommand to the helper.
+//
 // MIT License
 //
 
@@ -10,85 +13,6 @@ import ChargeCapCore
 import Combine
 import Foundation
 import UserNotifications
-
-public enum CalibrationPhase: Int, CaseIterable, Codable, Sendable, Identifiable {
-    case chargeToFullFirst = 1
-    case dischargeTo15 = 2
-    case chargeToFullSecond = 3
-    case holdAt100 = 4
-    case restoreToLimit = 5
-
-    public var id: Int { rawValue }
-
-    public var title: String {
-        switch self {
-        case .chargeToFullFirst: return "Step 1/5 · Charge to 100%"
-        case .dischargeTo15: return "Step 2/5 · Discharge to 15%"
-        case .chargeToFullSecond: return "Step 3/5 · Recharge to 100%"
-        case .holdAt100: return "Step 4/5 · Hold at 100% (1 hr)"
-        case .restoreToLimit: return "Step 5/5 · Restore to Limit"
-        }
-    }
-
-    public var shortTitle: String {
-        switch self {
-        case .chargeToFullFirst: return "Charging → 100%"
-        case .dischargeTo15: return "Discharging → 15%"
-        case .chargeToFullSecond: return "Recharging → 100%"
-        case .holdAt100: return "Holding 100%"
-        case .restoreToLimit: return "Restoring Limit"
-        }
-    }
-}
-
-public enum OperatingMode: Equatable, Sendable {
-    case chargingToLimit(target: Int)
-    case holdingAtLimit(limit: Int)
-    case sailing(lowerBound: Int, upperBound: Int)
-    case discharging(target: Int, automatic: Bool)
-    case topUp
-    case calibrating(CalibrationPhase)
-    case heatProtectionPaused(tempC: Double, maxC: Double)
-    case onBattery
-    case sleepingPaused
-
-    public var badgeText: String {
-        switch self {
-        case .chargingToLimit(let target):
-            return "Charging to \(target)%"
-        case .holdingAtLimit(let limit):
-            return "Paused at \(limit)%"
-        case .sailing(let low, let high):
-            return "Sailing (\(low)–\(high)%)"
-        case .discharging(let target, let auto):
-            return auto ? "Auto-Discharging to \(target)%" : "Discharging to \(target)%"
-        case .topUp:
-            return "Top Up to 100%"
-        case .calibrating(let phase):
-            return "Calibration · \(phase.shortTitle)"
-        case .heatProtectionPaused(let tempC, _):
-            return String(format: "Heat Protection (%.1f°C)", tempC)
-        case .onBattery:
-            return "Running on Battery"
-        case .sleepingPaused:
-            return "Sleep Charge Inhibit"
-        }
-    }
-
-    public var symbolName: String {
-        switch self {
-        case .chargingToLimit: return "bolt.fill"
-        case .holdingAtLimit: return "pause.circle.fill"
-        case .sailing: return "sailboat.fill"
-        case .discharging: return "arrow.down.circle.fill"
-        case .topUp: return "arrow.up.to.line.circle.fill"
-        case .calibrating: return "arrow.triangle.2.circlepath.circle.fill"
-        case .heatProtectionPaused: return "flame.fill"
-        case .onBattery: return "battery.75percent"
-        case .sleepingPaused: return "moon.zzz.fill"
-        }
-    }
-}
 
 public struct TelemetryHistoryPoint: Identifiable, Sendable {
     public let id = UUID()
@@ -107,133 +31,222 @@ public final class ChargeController: ObservableObject {
 
     @Published public private(set) var snapshot: BatterySnapshot
     @Published public private(set) var operatingMode: OperatingMode = .holdingAtLimit(limit: 80)
+    /// Setting these from outside re-evaluates immediately (the policy may still cancel them).
     @Published public var isTopUpActive: Bool = false {
-        didSet { evaluateAndApply() }
+        didSet {
+            guard !applyingPolicy, oldValue != isTopUpActive else { return }
+            persistState()
+            evaluateAndApply()
+        }
     }
     @Published public var isManualDischargeActive: Bool = false {
-        didSet { evaluateAndApply() }
+        didSet {
+            guard !applyingPolicy, oldValue != isManualDischargeActive else { return }
+            persistState()
+            evaluateAndApply()
+        }
     }
     @Published public private(set) var calibrationPhase: CalibrationPhase? = nil
     @Published public private(set) var calibrationHoldStart: Date? = nil
     @Published public private(set) var calibrationStartedAt: Date? = nil
     @Published public private(set) var isHeatPaused: Bool = false
+    /// Short in-memory history for live sparklines (persisted history lives in HistoryStore).
     @Published public private(set) var history: [TelemetryHistoryPoint] = []
     @Published public private(set) var lastActionSummary: String = "Monitoring battery telemetry"
 
+    private static let maxLiveHistory = 180
+
     private var timer: Timer?
     private var cancellables = Set<AnyCancellable>()
-    private var wasPluggedIn: Bool = true
-    private var wasBelowLimit: Bool = false
+    private var applyingPolicy = false
+    private var heatPausedSince: Date?
+
+    // Hardware re-assert bookkeeping.
+    private var lastCommand: HardwareCommand?
+    private var reassertPending = true
+    private var lastReassert = Date.distantPast
+    private var lastContradictionReassert = Date.distantPast
+    private var ledRestoreOnWake = false
+    private var lastClassicLimit: Int?
+
+    private let store: UserDefaults
 
     public var isCalibrating: Bool {
         calibrationPhase != nil
     }
 
-    public var calibrationHoldRemainingSeconds: Int {
+    // MARK: Calibration timing helpers
+
+    public var calibrationHoldElapsedSeconds: Int {
         guard calibrationPhase == .holdAt100, let start = calibrationHoldStart else { return 0 }
-        let elapsed = Int(Date().timeIntervalSince(start))
-        return max(0, 3600 - elapsed)
+        return max(0, Int(Date().timeIntervalSince(start)))
     }
 
+    /// Seconds until the hold ends at the latest (the hold normally ends earlier, when the gauge reports full).
+    public var calibrationHoldRemainingSeconds: Int {
+        guard calibrationPhase == .holdAt100, calibrationHoldStart != nil else { return 0 }
+        return max(0, Int(ChargePolicy.calibrationHoldMaximum) - calibrationHoldElapsedSeconds)
+    }
+
+    /// Seconds until the minimum hold has passed (the hold can't end before this).
+    public var calibrationHoldMinimumRemainingSeconds: Int {
+        guard calibrationPhase == .holdAt100, calibrationHoldStart != nil else { return 0 }
+        return max(0, Int(ChargePolicy.calibrationHoldMinimum) - calibrationHoldElapsedSeconds)
+    }
+
+    public var calibrationElapsedSeconds: Int {
+        guard let start = calibrationStartedAt else { return 0 }
+        return max(0, Int(Date().timeIntervalSince(start)))
+    }
+
+    // MARK: - Init
+
     private init() {
+        if Prefs.devMode, let dev = UserDefaults(suiteName: "com.chargecap.app.dev") {
+            store = dev
+        } else {
+            store = .standard
+        }
         let initial = BatteryTelemetryReader.readSnapshot()
         self.snapshot = initial
-        self.wasPluggedIn = initial.isPluggedIn
-        appendHistory(from: initial)
+        restoreState()
+        appendLiveHistory(from: initial)
 
-        // Observe preference changes
+        // Re-evaluate shortly after any preference change.
         Prefs.shared.objectWillChange
             .debounce(for: .milliseconds(100), scheduler: RunLoop.main)
+            .sink { [weak self] _ in self?.evaluateAndApply() }
+            .store(in: &cancellables)
+
+        // Reschedule the timer when the refresh interval changes.
+        Prefs.shared.$refreshIntervalSeconds
+            .removeDuplicates()
+            .dropFirst()
             .sink { [weak self] _ in
-                self?.evaluateAndApply()
+                Task { @MainActor in self?.rescheduleTimerIfRunning() }
+            }
+            .store(in: &cancellables)
+
+        // Apply the Low Power Mode policy when it changes (not every tick).
+        Prefs.shared.$lowPowerModePolicy
+            .removeDuplicates()
+            .dropFirst()
+            .sink { [weak self] policy in
+                Task { @MainActor in self?.applyLowPowerPolicy(policy) }
+            }
+            .store(in: &cancellables)
+
+        // Re-send everything when the helper (re)connects.
+        HelperClient.shared.$isHelperConnected
+            .removeDuplicates()
+            .dropFirst()
+            .sink { [weak self] connected in
+                guard connected else { return }
+                Task { @MainActor in
+                    guard let self else { return }
+                    self.reassertPending = true
+                    self.evaluateAndApply()
+                    self.applyLowPowerPolicy(Prefs.shared.lowPowerModePolicy)
+                }
             }
             .store(in: &cancellables)
 
         registerSleepWakeNotifications()
     }
 
-    public func startMonitoring() {
-        HelperClient.shared.checkHelperStatus()
-        refreshNow()
+    // MARK: - Monitoring
 
-        timer?.invalidate()
-        timer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                self?.refreshNow()
+    public func startMonitoring() {
+        if !Prefs.devMode {
+            HelperClient.shared.checkHelperStatus()
+            requestNotificationAuthorization()
+            if Prefs.shared.lowPowerModePolicy != .unmanaged {
+                applyLowPowerPolicy(Prefs.shared.lowPowerModePolicy)
             }
         }
+        HistoryStore.shared.recordHealth(snapshot: snapshot)
+        refreshNow()
+        rescheduleTimer()
+    }
+
+    private func rescheduleTimerIfRunning() {
+        if timer != nil { rescheduleTimer() }
+    }
+
+    private func rescheduleTimer() {
+        timer?.invalidate()
+        let interval = TimeInterval(min(20, max(2, Prefs.shared.refreshIntervalSeconds)))
+        let t = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.refreshNow() }
+        }
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
     }
 
     public func refreshNow() {
         let latest = BatteryTelemetryReader.readSnapshot()
-        handlePlugTransition(previous: wasPluggedIn, current: latest.isPluggedIn)
-        wasPluggedIn = latest.isPluggedIn
         self.snapshot = latest
-        appendHistory(from: latest)
+        appendLiveHistory(from: latest)
+        HistoryStore.shared.record(snapshot: latest, limit: Prefs.shared.chargeLimit)
         evaluateAndApply()
     }
 
+    /// Evaluates the policy against a caller-supplied snapshot (tests / previews).
     public func evaluateWithSnapshot(_ customSnapshot: BatterySnapshot) {
         self.snapshot = customSnapshot
         evaluateAndApply()
     }
 
-    // MARK: - User Actions
+    // MARK: - User actions
 
-    public func toggleTopUp() {
-        if isTopUpActive {
-            isTopUpActive = false
-        } else {
-            isManualDischargeActive = false
-            calibrationPhase = nil
-            isTopUpActive = true
+    public func setTopUp(_ enabled: Bool) {
+        mutateState {
+            if enabled {
+                isManualDischargeActive = false
+                clearCalibration()
+            }
+            isTopUpActive = enabled
         }
     }
 
-    public func toggleManualDischarge() {
-        if isManualDischargeActive {
-            isManualDischargeActive = false
-        } else {
-            isTopUpActive = false
-            calibrationPhase = nil
-            isManualDischargeActive = true
+    public func setManualDischarge(_ enabled: Bool) {
+        mutateState {
+            if enabled {
+                isTopUpActive = false
+                clearCalibration()
+            }
+            isManualDischargeActive = enabled
         }
     }
+
+    public func toggleTopUp() { setTopUp(!isTopUpActive) }
+
+    public func toggleManualDischarge() { setManualDischarge(!isManualDischargeActive) }
 
     public func startCalibration() {
-        isTopUpActive = false
-        isManualDischargeActive = false
-        calibrationStartedAt = Date()
-        calibrationHoldStart = nil
-        calibrationPhase = .chargeToFullFirst
-        evaluateAndApply()
+        mutateState {
+            isTopUpActive = false
+            isManualDischargeActive = false
+            calibrationStartedAt = Date()
+            calibrationHoldStart = nil
+            calibrationPhase = .chargeToFullFirst
+        }
     }
 
     public func advanceCalibrationStep() {
         guard let phase = calibrationPhase else { return }
-        switch phase {
-        case .chargeToFullFirst:
-            calibrationPhase = .dischargeTo15
-        case .dischargeTo15:
-            calibrationPhase = .chargeToFullSecond
-        case .chargeToFullSecond:
-            calibrationHoldStart = Date()
-            calibrationPhase = .holdAt100
-        case .holdAt100:
-            calibrationPhase = .restoreToLimit
-        case .restoreToLimit:
-            calibrationPhase = nil
-            calibrationStartedAt = nil
-            calibrationHoldStart = nil
+        mutateState {
+            if let next = phase.next {
+                calibrationPhase = next
+                calibrationHoldStart = (next == .holdAt100) ? Date() : nil
+            } else {
+                clearCalibration()
+            }
         }
-        evaluateAndApply()
     }
 
     public func stopCalibration() {
-        calibrationPhase = nil
-        calibrationHoldStart = nil
-        calibrationStartedAt = nil
-        evaluateAndApply()
+        mutateState { clearCalibration() }
     }
 
     public func setChargeLimit(_ newLimit: Int) {
@@ -241,279 +254,219 @@ public final class ChargeController: ObservableObject {
         evaluateAndApply()
     }
 
-    // MARK: - Core Control State Machine
+    private func clearCalibration() {
+        calibrationPhase = nil
+        calibrationHoldStart = nil
+        calibrationStartedAt = nil
+    }
 
-    public func evaluateAndApply() {
+    /// Mutates transient state without per-property re-evaluation, then evaluates once.
+    private func mutateState(_ block: () -> Void) {
+        applyingPolicy = true
+        block()
+        applyingPolicy = false
+        persistState()
+        evaluateAndApply()
+    }
+
+    // MARK: - Core evaluation
+
+    /// Runs the policy and sends the resulting command. `force` re-sends all hardware state.
+    public func evaluateAndApply(force: Bool = false) {
         let prefs = Prefs.shared
-        let helper = HelperClient.shared
-        let currentLevel = snapshot.percentage(useHardware: prefs.useHardwarePercentage)
-        let currentInt = Int(currentLevel.rounded())
-        let limit = prefs.chargeLimit
+        let now = Date()
 
-        // Classic Intel BCLM key support if explicitly toggled
-        if prefs.useClassicIntelKey {
-            helper.setClassicMaxCharge(UInt8(limit))
+        let input = PolicyInput(
+            snapshot: snapshot,
+            limit: prefs.chargeLimit,
+            sailingEnabled: prefs.sailingModeEnabled,
+            sailingLowerBound: prefs.sailingTarget,
+            heatEnabled: prefs.heatProtectionEnabled,
+            heatMaxC: prefs.heatProtectionMaxCelsius,
+            autoDischarge: prefs.autoDischargeEnabled,
+            dischargeInClamshell: prefs.dischargeInClamshell,
+            lidClosed: snapshot.lidClosed,
+            topUpActive: isTopUpActive,
+            manualDischargeActive: isManualDischargeActive,
+            calibrationPhase: calibrationPhase,
+            calibrationHoldStart: calibrationHoldStart,
+            heatPausedSince: heatPausedSince,
+            useHardwarePercentage: prefs.useHardwarePercentage,
+            disableSleepUntilLimit: prefs.disableSleepUntilChargeLimit,
+            ledMode: prefs.magSafeLEDMode,
+            ledBlinkWhileDischarging: prefs.ledBlinkWhileDischarging,
+            topUpAutoRevertAt100: prefs.topUpAutoRevertAt100,
+            topUpAutoRevertOnUnplug: prefs.topUpAutoRevertOnUnplug,
+            previousMode: operatingMode,
+            now: now
+        )
+        let out = ChargePolicy.evaluate(input)
+
+        // Store the new transient state.
+        applyingPolicy = true
+        if isTopUpActive != out.topUpActive { isTopUpActive = out.topUpActive }
+        if isManualDischargeActive != out.manualDischargeActive { isManualDischargeActive = out.manualDischargeActive }
+        if calibrationPhase != out.calibrationPhase { calibrationPhase = out.calibrationPhase }
+        if calibrationHoldStart != out.calibrationHoldStart { calibrationHoldStart = out.calibrationHoldStart }
+        if out.calibrationPhase == nil && calibrationStartedAt != nil { calibrationStartedAt = nil }
+        if isHeatPaused != out.isHeatPaused { isHeatPaused = out.isHeatPaused }
+        if operatingMode != out.mode { operatingMode = out.mode }
+        if lastActionSummary != out.summary { lastActionSummary = out.summary }
+        applyingPolicy = false
+        heatPausedSince = out.heatPausedSince
+        let stateChanged = !out.events.isEmpty
+        if stateChanged { persistState() }
+
+        for event in out.events { handle(event, prefs: prefs) }
+
+        // Hardware.
+        var command = out.command
+        var reassert = force || reassertPending
+        if now.timeIntervalSince(lastReassert) >= 60 { reassert = true }
+        if let prev = lastCommand, now.timeIntervalSince(lastContradictionReassert) >= 15, contradicts(prev) {
+            reassert = true
+            lastContradictionReassert = now
+        }
+        if ledRestoreOnWake {
+            if command.magSafeLED == nil { command.magSafeLED = ChargePolicy.ledSystem }
+            ledRestoreOnWake = false
+            reassert = true
+        }
+        if reassert {
+            lastReassert = now
+            reassertPending = false
+        }
+        lastCommand = out.command
+        HelperClient.shared.apply(command, force: reassert)
+
+        if prefs.useClassicIntelKey, lastClassicLimit != prefs.chargeLimit {
+            lastClassicLimit = prefs.chargeLimit
+            HelperClient.shared.setClassicMaxCharge(UInt8(clamping: prefs.chargeLimit))
         }
 
-        // 1. Check Thermal / Heat Protection with 2.0 C hysteresis
-        if prefs.heatProtectionEnabled {
-            if snapshot.batteryTemperatureC >= prefs.heatProtectionMaxCelsius {
-                if !isHeatPaused {
-                    isHeatPaused = true
-                    sendNotification(
-                        title: "Heat Protection Activated",
-                        body: "Battery reached \(prefs.formatTemperature(snapshot.batteryTemperatureC)). Charging paused until it cools down."
-                    )
-                }
-            } else if isHeatPaused && snapshot.batteryTemperatureC <= (prefs.heatProtectionMaxCelsius - 2.0) {
-                isHeatPaused = false
+        SleepControl.shared.evaluate(batteryPercent: snapshot.osPercentage, isPluggedIn: snapshot.isPluggedIn)
+    }
+
+    /// True when telemetry shows the hardware isn't doing what the previous command asked.
+    private func contradicts(_ prev: HardwareCommand) -> Bool {
+        if !prev.chargingEnabled && !prev.forceDischarge
+            && snapshot.isCharging && snapshot.isPluggedIn && !snapshot.forceDischargingBySMC {
+            return true
+        }
+        if prev.forceDischarge && snapshot.isPluggedIn && !snapshot.forceDischargingBySMC {
+            return true
+        }
+        return false
+    }
+
+    // MARK: - Events -> notifications
+
+    private func handle(_ event: PolicyEvent, prefs: Prefs) {
+        switch event {
+        case .limitReached(let limit):
+            if prefs.notifyLimitReached {
+                postNotification(title: "Charge Limit Reached (\(limit)%)", body: "MacBook is now powered directly by the adapter.")
             }
+        case .topUpComplete:
+            if prefs.notifyTopUp {
+                postNotification(title: "Top Up Complete", body: "Battery reached 100%. Returning to \(prefs.chargeLimit)% charge limit.")
+            }
+        case .topUpCancelledByUnplug:
+            break
+        case .dischargeComplete(let target):
+            if prefs.notifyDischarge {
+                postNotification(title: "Discharge Complete", body: "Battery discharged to target \(target)%.")
+            }
+        case .manualDischargeCancelled:
+            break
+        case .heatPaused(let tempC):
+            if prefs.notifyHeat {
+                postNotification(title: "Heat Protection Activated",
+                                 body: "Battery reached \(prefs.formatTemperature(tempC)). Charging paused until it cools down.")
+            }
+        case .heatResumed:
+            if prefs.notifyHeat, prefs.heatProtectionEnabled {
+                postNotification(title: "Heat Protection Ended", body: "Battery has cooled down. Charging can resume.")
+            }
+        case .calibrationAdvanced(let phase):
+            if prefs.notifyCalibration {
+                postNotification(title: "Calibration", body: phase.title)
+            }
+        case .calibrationFinished:
+            if prefs.notifyCalibration {
+                postNotification(title: "Battery Calibration Finished",
+                                 body: "Full cycle calibration completed and battery returned to \(prefs.chargeLimit)%.")
+            }
+        }
+    }
+
+    private var canUseNotifications: Bool {
+        !Prefs.devMode && Bundle.main.bundleIdentifier != nil
+    }
+
+    private func requestNotificationAuthorization() {
+        guard canUseNotifications else { return }
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+    }
+
+    /// Posts a user notification if notifications are enabled (also used by the scheduler).
+    public func postNotification(title: String, body: String) {
+        guard Prefs.shared.notificationsEnabled, canUseNotifications else { return }
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        let req = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(req)
+    }
+
+    // MARK: - Low Power Mode policy
+
+    private func applyLowPowerPolicy(_ policy: LowPowerModePolicy) {
+        guard !Prefs.devMode, let desired = policy.desiredState else { return }
+        HelperClient.shared.setLowPowerMode(desired.battery, scope: .battery)
+        HelperClient.shared.setLowPowerMode(desired.adapter, scope: .adapter)
+    }
+
+    // MARK: - Persistence of transient state
+
+    private enum Key {
+        static let topUp = "state.topUpActive"
+        static let discharge = "state.manualDischargeActive"
+        static let phase = "state.calibrationPhase"
+        static let holdStart = "state.calibrationHoldStart"
+        static let startedAt = "state.calibrationStartedAt"
+    }
+
+    private func persistState() {
+        store.set(isTopUpActive, forKey: Key.topUp)
+        store.set(isManualDischargeActive, forKey: Key.discharge)
+        if let phase = calibrationPhase {
+            store.set(phase.rawValue, forKey: Key.phase)
         } else {
-            isHeatPaused = false
+            store.removeObject(forKey: Key.phase)
         }
-
-        // 2. If unplugged and not force-discharging, we are simply on battery
-        if !snapshot.isPluggedIn && !snapshot.forceDischargingBySMC {
-            operatingMode = .onBattery
-            helper.setPreventSleep(false)
-            lastActionSummary = "On battery power (\(currentInt)%)"
-            return
-        }
-
-        // 3. Heat Protection overrides charging
-        if isHeatPaused {
-            operatingMode = .heatProtectionPaused(
-                tempC: snapshot.batteryTemperatureC,
-                maxC: prefs.heatProtectionMaxCelsius
-            )
-            helper.setForceDischarge(false)
-            helper.setChargingEnabled(false)
-            syncMagSafeLED(for: operatingMode)
-            lastActionSummary = "Charging paused by Heat Protection (\(prefs.formatTemperature(snapshot.batteryTemperatureC)))"
-            return
-        }
-
-        // 4. Calibration Mode State Machine
-        if let calPhase = calibrationPhase {
-            handleCalibrationPhase(calPhase, currentInt: currentInt, limit: limit)
-            return
-        }
-
-        // 5. Top Up Mode (Charge to 100%)
-        if isTopUpActive {
-            if currentInt >= 100 && prefs.topUpAutoRevertAt100 {
-                isTopUpActive = false
-                sendNotification(
-                    title: "Top Up Complete",
-                    body: "Battery reached 100%. Returning to \(limit)% charge limit."
-                )
-            } else {
-                operatingMode = .topUp
-                helper.setForceDischarge(false)
-                helper.setChargingEnabled(true)
-                helper.setPreventSleep(prefs.disableSleepUntilChargeLimit, reason: "ChargeCap Top Up")
-                syncMagSafeLED(for: operatingMode)
-                lastActionSummary = "Topping up battery to 100% (currently \(currentInt)%)"
-                return
-            }
-        }
-
-        // 6. Manual or Automatic Discharge when above limit
-        let shouldAutoDischarge = prefs.autoDischargeEnabled && currentInt > limit
-        if isManualDischargeActive || shouldAutoDischarge {
-            if currentInt <= limit {
-                // Reached target limit: stop discharging and hold at limit
-                if isManualDischargeActive {
-                    isManualDischargeActive = false
-                    sendNotification(
-                        title: "Discharge Complete",
-                        body: "Battery discharged to target \(limit)%."
-                    )
-                }
-                operatingMode = .holdingAtLimit(limit: limit)
-                helper.setForceDischarge(false)
-                helper.setChargingEnabled(false)
-                helper.setPreventSleep(false)
-                syncMagSafeLED(for: operatingMode)
-                lastActionSummary = "Reached \(limit)% limit · Holding on adapter power"
-                return
-            } else {
-                operatingMode = .discharging(target: limit, automatic: !isManualDischargeActive)
-                helper.setForceDischarge(true)
-                helper.setPreventSleep(prefs.dischargeInClamshell, reason: "ChargeCap Active Discharge")
-                syncMagSafeLED(for: operatingMode)
-                lastActionSummary = "Actively discharging to \(limit)% (currently \(currentInt)%)"
-                return
-            }
-        }
-
-        // 7. Standard Charge Limiter + Sailing Mode
-        let sailLower = prefs.sailingModeEnabled ? prefs.sailingTarget : limit
-
-        if currentInt < sailLower {
-            // Below Charge Limit (and below Sailing lower bound): Enable Charging
-            operatingMode = .chargingToLimit(target: limit)
-            helper.setForceDischarge(false)
-            helper.setChargingEnabled(true)
-            helper.setPreventSleep(prefs.disableSleepUntilChargeLimit, reason: "ChargeCap Charging to Limit")
-            wasBelowLimit = true
-            lastActionSummary = "Charging toward \(limit)% limit"
-        } else if currentInt >= limit {
-            // At or above Charge Limit: Inhibit Charging
-            if wasBelowLimit && currentInt == limit {
-                wasBelowLimit = false
-                sendNotification(
-                    title: "Charge Limit Reached (\(limit)%)",
-                    body: "MacBook is now powered directly by the adapter."
-                )
-            }
-            if prefs.sailingModeEnabled && currentInt > limit {
-                operatingMode = .sailing(lowerBound: sailLower, upperBound: limit)
-                lastActionSummary = "Above \(limit)% · Sailing active (\(sailLower)–\(limit)%)"
-            } else {
-                operatingMode = .holdingAtLimit(limit: limit)
-                lastActionSummary = "Holding battery at \(limit)% on adapter power"
-            }
-            helper.setForceDischarge(false)
-            helper.setChargingEnabled(false)
-            helper.setPreventSleep(false)
-        } else {
-            // Inside the Sailing window: sailLower <= currentInt < limit
-            // If we were actively charging up from below sailLower, keep charging until we hit `limit`.
-            // Otherwise, sail without charging!
-            if case .chargingToLimit = operatingMode {
-                operatingMode = .chargingToLimit(target: limit)
-                helper.setForceDischarge(false)
-                helper.setChargingEnabled(true)
-                helper.setPreventSleep(prefs.disableSleepUntilChargeLimit, reason: "ChargeCap Charging to Limit")
-                lastActionSummary = "Charging through sailing band to \(limit)%"
-            } else {
-                operatingMode = .sailing(lowerBound: sailLower, upperBound: limit)
-                helper.setForceDischarge(false)
-                helper.setChargingEnabled(false)
-                helper.setPreventSleep(false)
-                lastActionSummary = "Sailing between \(sailLower)% and \(limit)% (no micro-charging)"
-            }
-        }
-
-        syncMagSafeLED(for: operatingMode)
+        if let d = calibrationHoldStart { store.set(d, forKey: Key.holdStart) } else { store.removeObject(forKey: Key.holdStart) }
+        if let d = calibrationStartedAt { store.set(d, forKey: Key.startedAt) } else { store.removeObject(forKey: Key.startedAt) }
     }
 
-    private func handleCalibrationPhase(_ phase: CalibrationPhase, currentInt: Int, limit: Int) {
-        let helper = HelperClient.shared
-        switch phase {
-        case .chargeToFullFirst:
-            if currentInt >= 100 {
-                calibrationPhase = .dischargeTo15
-                handleCalibrationPhase(.dischargeTo15, currentInt: currentInt, limit: limit)
-                return
-            }
-            operatingMode = .calibrating(.chargeToFullFirst)
-            helper.setForceDischarge(false)
-            helper.setChargingEnabled(true)
-            helper.setPreventSleep(true, reason: "ChargeCap Calibration Step 1")
-            lastActionSummary = "Calibration 1/5: Charging to 100% (\(currentInt)%)"
-
-        case .dischargeTo15:
-            if currentInt <= 15 {
-                calibrationPhase = .chargeToFullSecond
-                handleCalibrationPhase(.chargeToFullSecond, currentInt: currentInt, limit: limit)
-                return
-            }
-            operatingMode = .calibrating(.dischargeTo15)
-            helper.setForceDischarge(true)
-            helper.setPreventSleep(true, reason: "ChargeCap Calibration Step 2")
-            lastActionSummary = "Calibration 2/5: Discharging to 15% (\(currentInt)%)"
-
-        case .chargeToFullSecond:
-            if currentInt >= 100 {
-                calibrationHoldStart = Date()
-                calibrationPhase = .holdAt100
-                handleCalibrationPhase(.holdAt100, currentInt: currentInt, limit: limit)
-                return
-            }
-            operatingMode = .calibrating(.chargeToFullSecond)
-            helper.setForceDischarge(false)
-            helper.setChargingEnabled(true)
-            helper.setPreventSleep(true, reason: "ChargeCap Calibration Step 3")
-            lastActionSummary = "Calibration 3/5: Recharging to 100% (\(currentInt)%)"
-
-        case .holdAt100:
-            if calibrationHoldStart == nil {
-                calibrationHoldStart = Date()
-            }
-            if calibrationHoldRemainingSeconds <= 0 {
-                calibrationPhase = .restoreToLimit
-                handleCalibrationPhase(.restoreToLimit, currentInt: currentInt, limit: limit)
-                return
-            }
-            operatingMode = .calibrating(.holdAt100)
-            helper.setForceDischarge(false)
-            helper.setChargingEnabled(true)
-            helper.setPreventSleep(true, reason: "ChargeCap Calibration Step 4")
-            let mins = calibrationHoldRemainingSeconds / 60
-            lastActionSummary = "Calibration 4/5: Saturation hold at 100% (\(mins)m left)"
-
-        case .restoreToLimit:
-            if currentInt <= limit {
-                calibrationPhase = nil
-                calibrationHoldStart = nil
-                calibrationStartedAt = nil
-                sendNotification(
-                    title: "Battery Calibration Finished",
-                    body: "Full cycle calibration completed and battery returned to \(limit)%."
-                )
-                evaluateAndApply()
-                return
-            }
-            operatingMode = .calibrating(.restoreToLimit)
-            helper.setForceDischarge(true)
-            helper.setPreventSleep(true, reason: "ChargeCap Calibration Step 5")
-            lastActionSummary = "Calibration 5/5: Discharging back to \(limit)% (\(currentInt)%)"
+    private func restoreState() {
+        applyingPolicy = true
+        isTopUpActive = store.bool(forKey: Key.topUp)
+        isManualDischargeActive = store.bool(forKey: Key.discharge)
+        if store.object(forKey: Key.phase) != nil {
+            calibrationPhase = CalibrationPhase(rawValue: store.integer(forKey: Key.phase))
         }
-        syncMagSafeLED(for: operatingMode)
+        if calibrationPhase != nil {
+            calibrationHoldStart = store.object(forKey: Key.holdStart) as? Date
+            calibrationStartedAt = store.object(forKey: Key.startedAt) as? Date
+        }
+        applyingPolicy = false
     }
 
-    private func syncMagSafeLED(for mode: OperatingMode) {
-        let ledPref = Prefs.shared.magSafeLEDMode
-        let helper = HelperClient.shared
+    // MARK: - Live history
 
-        switch ledPref {
-        case .system:
-            helper.setMagSafeLED(0x00)
-        case .off:
-            helper.setMagSafeLED(0x01)
-        case .green:
-            helper.setMagSafeLED(0x03)
-        case .orange:
-            helper.setMagSafeLED(0x04)
-        case .auto:
-            switch mode {
-            case .chargingToLimit, .topUp:
-                helper.setMagSafeLED(0x04) // Amber while charging
-            case .calibrating(let phase):
-                let isChargingPhase = (phase == .chargeToFullFirst || phase == .chargeToFullSecond)
-                helper.setMagSafeLED(isChargingPhase ? 0x04 : 0x03)
-            case .holdingAtLimit, .sailing, .discharging:
-                helper.setMagSafeLED(0x03) // Green when capped / sailing / discharging
-            case .heatProtectionPaused:
-                helper.setMagSafeLED(0x02) // Slow amber pulse on thermal protection
-            case .onBattery, .sleepingPaused:
-                break
-            }
-        }
-    }
-
-    private func handlePlugTransition(previous: Bool, current: Bool) {
-        if previous && !current && !snapshot.forceDischargingBySMC {
-            if isTopUpActive && Prefs.shared.topUpAutoRevertOnUnplug {
-                isTopUpActive = false
-            }
-        }
-    }
-
-    private func appendHistory(from snap: BatterySnapshot) {
-        let point = TelemetryHistoryPoint(
+    private func appendLiveHistory(from snap: BatterySnapshot) {
+        history.append(TelemetryHistoryPoint(
             timestamp: snap.timestamp,
             osPercent: Double(snap.osPercentage),
             hwPercent: snap.hardwarePercentage,
@@ -521,60 +474,54 @@ public final class ChargeController: ObservableObject {
             adapterWatts: snap.adapterInputWatts,
             systemWatts: snap.systemLoadWatts,
             temperatureC: snap.batteryTemperatureC
-        )
-        history.append(point)
-        if history.count > 120 {
-            history.removeFirst(history.count - 120)
+        ))
+        if history.count > Self.maxLiveHistory {
+            history.removeFirst(history.count - Self.maxLiveHistory)
         }
     }
 
-    // MARK: - Sleep & Termination Lifecycle
+    // MARK: - Sleep & termination lifecycle
 
     private func registerSleepWakeNotifications() {
         let ws = NSWorkspace.shared.notificationCenter
         ws.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
-            Task { @MainActor in
-                self?.handleWillSleep()
-            }
+            Task { @MainActor in self?.handleWillSleep() }
         }
         ws.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
-            Task { @MainActor in
-                self?.refreshNow()
-            }
+            Task { @MainActor in self?.handleDidWake() }
         }
     }
 
     public func handleWillSleep() {
         let prefs = Prefs.shared
-        let helper = HelperClient.shared
+        var cmd = lastCommand ?? HardwareCommand(chargingEnabled: true, forceDischarge: false, magSafeLED: nil, preventSleep: false)
+        cmd.magSafeLED = nil
         if !prefs.dischargeInClamshell {
-            helper.setForceDischarge(false)
+            cmd.forceDischarge = false
         }
         if prefs.stopChargingWhenSleeping {
-            helper.setChargingEnabled(false)
+            cmd.chargingEnabled = false
             operatingMode = .sleepingPaused
             lastActionSummary = "Paused charging before system sleep"
         }
+        if cmd.forceDischarge { cmd.chargingEnabled = false }
+        if prefs.ledOffDuringSleep {
+            cmd.magSafeLED = ChargePolicy.ledOff
+            ledRestoreOnWake = true
+        }
+        HelperClient.shared.apply(cmd)
+    }
+
+    public func handleDidWake() {
+        reassertPending = true
+        refreshNow()
     }
 
     public func handleAppTermination() {
-        let prefs = Prefs.shared
-        let helper = HelperClient.shared
-        helper.setPreventSleep(false)
-        helper.setForceDischarge(false)
-        if prefs.stopChargingWhenPoweredOff {
-            helper.setChargingEnabled(false)
-        } else {
-            helper.resetAllOnExit()
-        }
-    }
-
-    private func sendNotification(title: String, body: String) {
-        guard Prefs.shared.notificationsEnabled, !Prefs.devMode else { return }
-        let content = UNMutableNotificationContent()
-        content.title = title
-        content.body = body
-        let req = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
-        UNUserNotificationCenter.current().add(req)
+        timer?.invalidate()
+        timer = nil
+        persistState()
+        HistoryStore.shared.flush(wait: true)
+        HelperClient.shared.restoreOnQuit(keepChargeInhibited: Prefs.shared.stopChargingWhenAppClosed)
     }
 }
